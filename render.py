@@ -7,7 +7,7 @@ from barcode_server import app  # আপনার মূল ফাইল থে�
 
 # ==================== CONFIGURATION ====================
 # PING_URL = "https://barcode-server-am77.onrender.com"  # আপনি চাইলে আপনার URL বসান
-PING_URL = os.getenv('RENDER_EXTERNAL_URL', 'https://barcode-server-am77.onrender.com')
+PING_URL = os.getenv('RENDER_EXTERNAL_URL', 'https://barcode-server-6vss.onrender.com')
 PING_INTERVAL = 12 * 60  # 12 মিনিট
 
 # লগিং
