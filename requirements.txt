@@ -2,3 +2,4 @@ flask
 flask-limiter
 flask-caching
 requests
+gunicorn
