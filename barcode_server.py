@@ -30,7 +30,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ==================== API KEYS MANAGER ====================
+# ==================== API KEYS MANAGER (unchanged) ====================
 def load_api_keys():
     if not os.path.exists(API_KEYS_FILE):
         default_key = os.environ.get('BARCODE_API_KEY', 'your-strong-api-key-here-12345')
@@ -112,7 +112,7 @@ def update_metrics(start_time, cache_hit=False):
         metrics['request_times'].pop(0)
     metrics['avg_response_time'] = sum(metrics['request_times']) / len(metrics['request_times'])
 
-# ==================== SECURITY HELPERS ====================
+# ==================== SECURITY HELPERS (unchanged) ====================
 def sanitize_csv_field(value):
     if isinstance(value, str) and value and value[0] in '+-=@':
         return "'" + value
@@ -124,16 +124,13 @@ def is_safe_url(url):
         parsed = urlparse(url)
         if parsed.scheme not in ('http', 'https'):
             return False, "Only HTTP/HTTPS protocols are allowed."
-        
         hostname = parsed.hostname
         if not hostname:
             return False, "Invalid hostname."
-        
         try:
             ip_addresses = socket.getaddrinfo(hostname, None)
         except:
             return False, "Cannot resolve hostname."
-
         for addr in ip_addresses:
             ip_str = addr[4][0]
             if ':' in ip_str:
@@ -153,24 +150,19 @@ def is_safe_url(url):
 def validate_image_url(url, timeout=5):
     if not url:
         return False, "URL is empty."
-    
     safe, msg = is_safe_url(url)
     if not safe:
         return False, f"Security validation failed: {msg}"
-    
     try:
         resp = requests.head(url, timeout=timeout, allow_redirects=False)
         if resp.status_code not in (200, 301, 302):
             return False, f"HTTP error: {resp.status_code}"
-
         content_type = resp.headers.get('content-type', '')
         if not content_type.startswith('image/'):
             return False, f"Invalid content type: {content_type}. Only images are allowed."
-
         content_length = resp.headers.get('content-length')
         if content_length and int(content_length) > MAX_IMAGE_SIZE:
             return False, f"Image exceeds maximum size limit ({MAX_IMAGE_SIZE} bytes)."
-        
         return True, None
     except requests.exceptions.Timeout:
         return False, "Request timeout."
@@ -183,15 +175,12 @@ def download_safe_image(url):
     safe, msg = is_safe_url(url)
     if not safe:
         raise ValueError(f"URL blocked: {msg}")
-
     resp = requests.get(url, timeout=10, stream=True, allow_redirects=False)
     if resp.status_code != 200:
         raise Exception(f"HTTP error {resp.status_code}")
-    
     content_type = resp.headers.get('content-type', '')
     if not content_type.startswith('image/'):
         raise Exception(f"Invalid content type: {content_type}")
-
     downloaded = 0
     content = b''
     for chunk in resp.iter_content(chunk_size=8192):
@@ -201,16 +190,17 @@ def download_safe_image(url):
             raise Exception("Image download exceeded size limit.")
     return content, content_type
 
-# ==================== DATABASE CLASS (WITH DUPLICATE CHECK) ====================
+# ==================== DATABASE CLASS (MULTI-PRODUCT PER BARCODE) ====================
 class BarcodeDB:
     def __init__(self):
-        self.index = {}
+        self.index = {}  # barcode -> list of product dicts
         self.active_shard = None
         self.active_count = 0
         self.lock = threading.Lock()
         self._initialize()
 
     def _initialize(self):
+        # ----- Migrate legacy single CSV if exists -----
         legacy_file = 'my_products.csv'
         if os.path.exists(legacy_file) and not os.path.exists(INDEX_FILE):
             logger.info("Migrating from legacy my_products.csv ...")
@@ -223,19 +213,39 @@ class BarcodeDB:
                     writer.writerow(['barcode', 'product_name', 'image_url'])
                     for row in rows:
                         writer.writerow([row['barcode'], row['product_name'], row['image_url']])
-                        self.index[row['barcode']] = {
+                        # Build index: group by barcode
+                        bc = row['barcode']
+                        if bc not in self.index:
+                            self.index[bc] = []
+                        self.index[bc].append({
                             'name': row['product_name'],
                             'image': row['image_url'],
                             'shard': os.path.basename(shard_name)
-                        }
+                        })
                 with open(INDEX_FILE, 'w') as f:
                     json.dump(self.index, f, indent=2)
                 logger.info(f"Migration complete. {len(rows)} entries moved.")
 
+        # ----- Load existing index (may be old dict format) -----
         if os.path.exists(INDEX_FILE):
             with open(INDEX_FILE, 'r') as f:
-                self.index = json.load(f)
+                data = json.load(f)
+            # Convert old format (barcode -> dict) to new format (barcode -> list)
+            if data and isinstance(next(iter(data.values())), dict):
+                logger.info("Converting old index format to multi-product format...")
+                new_index = {}
+                for bc, prod in data.items():
+                    # prod was a dict with 'name', 'image', 'shard'
+                    new_index[bc] = [prod]
+                self.index = new_index
+                # Save new format
+                with open(INDEX_FILE, 'w') as f:
+                    json.dump(self.index, f, indent=2)
+                logger.info("Conversion complete.")
+            else:
+                self.index = data
 
+        # ----- Manage shard files -----
         shard_files = glob.glob(os.path.join(DATA_DIR, "my_products_*.csv"))
         if not shard_files:
             self._create_new_shard()
@@ -272,9 +282,7 @@ class BarcodeDB:
         except Exception as e:
             logger.warning(f"Background caching failed for {barcode}: {e}")
 
-    # ---------------------------------------------------------------
-    #  🛑 FIXED: Duplicate check added inside the thread lock
-    # ---------------------------------------------------------------
+    # ---------- ADD: allows multiple products per barcode, but prevents exact duplicate (same barcode+name) ----------
     def add(self, barcode, name, image, validate=True):
         clean_img = self._extract_url(image)
         safe_barcode = sanitize_csv_field(barcode)
@@ -287,43 +295,60 @@ class BarcodeDB:
                 return False, f"Image validation failed: {err_msg}"
 
         with self.lock:
-            # ---------- DUPLICATE CHECK ----------
-            combo_key = f"{raw_barcode}||{name.strip()}"
-            if combo_key in self.index:
-               return False, f"Product with barcode '{raw_barcode}' and name '{name}' already exists."
-            # -------------------------------------
+            # Check for exact duplicate (same barcode and same name)
+            if raw_barcode in self.index:
+                for prod in self.index[raw_barcode]:
+                    if prod['name'] == safe_name:
+                        return False, f"Product with barcode '{raw_barcode}' and name '{safe_name}' already exists."
 
+            # If barcode not present, create new list
+            if raw_barcode not in self.index:
+                self.index[raw_barcode] = []
+
+            # Append new product
+            new_product = {
+                'name': safe_name,
+                'image': clean_img,
+                'shard': os.path.basename(self.active_shard)
+            }
+            self.index[raw_barcode].append(new_product)
+
+            # Write to CSV (each product as separate row)
             if self.active_count >= SHARD_LIMIT:
                 self._create_new_shard()
-
             with open(self.active_shard, 'a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow([safe_barcode, safe_name, clean_img])
             self.active_count += 1
 
-            self.index[raw_barcode] = {
-                'name': safe_name,
-                'image': clean_img,
-                'shard': os.path.basename(self.active_shard)
-            }
-
+            # Save index
             with open(INDEX_FILE, 'w') as f:
                 json.dump(self.index, f, indent=2)
 
+            # Async image cache
             if clean_img:
                 executor.submit(self._cache_image_async, clean_img, raw_barcode)
 
-            logger.info(f"Product added: {raw_barcode}")
+            logger.info(f"Product added: {raw_barcode} -> {safe_name}")
             return True, "OK"
 
+    # ---------- LOOKUP: returns list of products for a barcode ----------
     def lookup(self, barcode):
-        return self.index.get(barcode.strip())
+        raw = barcode.strip()
+        return self.index.get(raw, [])
 
+    # ---------- GET ALL: flatten all products into list of dicts ----------
     def get_all(self):
-        return [
-            {'barcode': bc, 'product_name': info['name'], 'image_url': info['image']}
-            for bc, info in self.index.items()
-        ]
+        all_products = []
+        for bc, products in self.index.items():
+            for prod in products:
+                all_products.append({
+                    'barcode': bc,
+                    'product_name': prod['name'],
+                    'image_url': prod['image'],
+                    'shard': prod['shard']
+                })
+        return all_products
 
 db = BarcodeDB()
 
@@ -334,16 +359,13 @@ def require_api_key(f):
         if not key:
             logger.warning(f"Missing API Key from {request.remote_addr}")
             return jsonify({"error": "Missing X-API-Key header."}), 401
-
         api_keys = load_api_keys()
         if key not in api_keys:
             logger.warning(f"Invalid API Key attempt from {request.remote_addr}")
             return jsonify({"error": "Invalid API Key."}), 401
-
         if not api_keys[key].get('enabled', True):
             logger.warning(f"Disabled API Key used: {key[:10]}...")
             return jsonify({"error": "API Key is disabled."}), 403
-
         request.api_key_limits = api_keys[key].get('limits', {})
         request.api_key_name = api_keys[key].get('name', 'Unknown')
         return f(*args, **kwargs)
@@ -372,11 +394,11 @@ def get_image_limit():
 @limiter.limit("30 per second")
 def api_home():
     return jsonify({
-        "message": "Secure Multi-Key Barcode API",
+        "message": "Multi-Product Barcode API (same barcode supports multiple products)",
         "auth": "Provide X-API-Key header for POST/Export endpoints.",
         "endpoints": {
-            "GET /api/lookup/<barcode>": "Public (cached, low limit)",
-            "GET /api/lookup/<barcode>/image": "Public (cached, low limit)",
+            "GET /api/lookup/<barcode>": "Public (returns list of products)",
+            "GET /api/lookup/<barcode>/image": "Public (downloads first product's image)",
             "POST /api/add": "🔒 Requires Key (async background cache)",
             "GET /api/all": "Public (rate limited)",
             "GET /api/export": "🔒 Requires Key (ZIP download)",
@@ -392,16 +414,13 @@ def api_add_product():
     data = request.get_json()
     if not data:
         return jsonify({"error": "Send JSON payload."}), 400
-
     barcode = data.get('barcode')
     name = data.get('name')
     if not barcode or not name:
         return jsonify({"error": "Barcode and Name are required fields."}), 400
-
     success, msg = db.add(barcode, name, data.get('image', ''), validate=True)
     if not success:
         return jsonify({"error": msg}), 400
-
     logger.info(f"Product added by key: {getattr(request, 'api_key_name', 'Unknown')}")
     update_metrics(start)
     return jsonify({
@@ -414,22 +433,25 @@ def api_add_product():
 @limiter.limit(get_lookup_limit, key_func=get_custom_key)
 def api_lookup_product(barcode):
     start = time.time()
+    # Check cache for this barcode (store list in cache)
     cached = cache.get(barcode)
-    if cached:
+    if cached is not None:
         update_metrics(start, cache_hit=True)
-        return jsonify(cached)
+        # cached is the list of products
+        return jsonify({
+            "barcode": barcode,
+            "products": cached
+        })
 
-    result = db.lookup(barcode)
-    if result:
-        cache.set(barcode, result, timeout=3600)
+    products = db.lookup(barcode)
+    if products:
+        # Cache the list (products is list of dicts)
+        cache.set(barcode, products, timeout=3600)
         update_metrics(start, cache_hit=False)
         return jsonify({
             "barcode": barcode,
-            "product_name": result['name'],
-            "image_url": result['image'],
-            "shard": result['shard']
+            "products": products
         })
-    
     update_metrics(start)
     return jsonify({"error": "Barcode not found."}), 404
 
@@ -437,11 +459,12 @@ def api_lookup_product(barcode):
 @limiter.limit(get_image_limit, key_func=get_custom_key)
 def api_download_image(barcode):
     start = time.time()
-    result = db.lookup(barcode)
-    if not result:
+    products = db.lookup(barcode)
+    if not products:
         return jsonify({"error": "Barcode not found."}), 404
-
-    img_url = result.get('image', '')
+    # Use the first product's image (you may want to handle multiple images)
+    first = products[0]
+    img_url = first.get('image', '')
     if not img_url:
         return jsonify({"error": "No image associated with this product."}), 404
 
@@ -512,7 +535,7 @@ def get_metrics():
         "cache_hit_ratio": round(metrics['cache_hits'] / max(1, metrics['total_requests']) * 100, 2),
         "avg_response_time_ms": round(metrics['avg_response_time'], 2),
         "active_shard": os.path.basename(db.active_shard),
-        "total_entries": len(db.index)
+        "total_entries": len(db.index)  # number of unique barcodes
     })
 
 # ==================== REDIRECTS ====================
@@ -532,7 +555,7 @@ def redirect_export(): return redirect('/api/export')
 # ==================== CLI MANAGEMENT ====================
 def interactive_add():
     while True:
-        print("\n--- Add New Product ---")
+        print("\n--- Add New Product (supports multiple products per barcode) ---")
         barcode = input("Barcode: ").strip()
         if not barcode: continue
         name = input("Product Name: ").strip()
@@ -549,7 +572,11 @@ def interactive_add():
 
 def show_stats():
     shards = glob.glob(os.path.join(DATA_DIR, "my_products_*.csv"))
-    print(f"\n📊 Total Barcodes: {len(db.index)}")
+    total_products = 0
+    for prod_list in db.index.values():
+        total_products += len(prod_list)
+    print(f"\n📊 Unique Barcodes: {len(db.index)}")
+    print(f"📦 Total Products: {total_products}")
     print(f"📁 Total Shards: {len(shards)}")
     print(f"📄 Active Shard: {os.path.basename(db.active_shard)} ({db.active_count} rows)")
 
@@ -570,7 +597,6 @@ def manage_keys():
         except (ValueError, IndexError):
             print("Error: Invalid format. Use --add-key <key> --name <name>")
             return
-        
         limits = {}
         if '--limits' in sys.argv:
             try:
@@ -581,7 +607,6 @@ def manage_keys():
                     limits[k] = int(v)
             except:
                 print("Warning: Invalid limits format. Ignoring.")
-        
         success, msg = add_new_api_key(key, name, limits)
         print(f"{'✅' if success else '❌'} {msg}")
 
@@ -612,7 +637,7 @@ if __name__ == '__main__':
         else:
             print("Unknown command. Available: --add, --stats, --add-key, --remove-key, --list-keys")
     else:
-        print(f"🚀 Secure Multi-Key Server running at: http://localhost:5000")
+        print(f"🚀 Multi-Product Barcode Server running at: http://localhost:5000")
         print(f"🔑 Use 'X-API-Key' header for secure endpoints.")
         print(f"📊 Manage keys via CLI: --add-key, --remove-key, --list-keys")
         app.run(host='0.0.0.0', port=5000, debug=False)
