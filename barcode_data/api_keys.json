@@ -1,0 +1,20 @@
+{
+  "your-strong-api-key-here-12345": {
+    "name": "Default Admin Key",
+    "enabled": true,
+    "limits": {
+      "lookup": 300,
+      "image": 10,
+      "add": 10
+    }
+  },
+  "TEST_SUPER_KEY_2024": {
+    "name": "Unlimited Test Key",
+    "enabled": true,
+    "limits": {
+      "lookup": 99999,
+      "image": 99999,
+      "add": 99999
+    }
+  }
+}
