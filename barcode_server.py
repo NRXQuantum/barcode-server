@@ -288,8 +288,9 @@ class BarcodeDB:
 
         with self.lock:
             # ---------- DUPLICATE CHECK ----------
-            if raw_barcode in self.index:
-                return False, f"Barcode '{raw_barcode}' already exists. Duplicates are not allowed."
+            combo_key = f"{raw_barcode}||{name.strip()}"
+            if combo_key in self.index:
+               return False, f"Product with barcode '{raw_barcode}' and name '{name}' already exists."
             # -------------------------------------
 
             if self.active_count >= SHARD_LIMIT:
