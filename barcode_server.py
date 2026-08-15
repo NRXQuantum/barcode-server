@@ -190,7 +190,7 @@ def download_safe_image(url):
             raise Exception("Image download exceeded size limit.")
     return content, content_type
 
-# ==================== DATABASE CLASS (MULTI-PRODUCT PER BARCODE) ====================
+# ==================== DATABASE CLASS (MULTI-PRODUCT + UPDATE) ====================
 class BarcodeDB:
     def __init__(self):
         self.index = {}  # barcode -> list of product dicts
@@ -213,7 +213,6 @@ class BarcodeDB:
                     writer.writerow(['barcode', 'product_name', 'image_url'])
                     for row in rows:
                         writer.writerow([row['barcode'], row['product_name'], row['image_url']])
-                        # Build index: group by barcode
                         bc = row['barcode']
                         if bc not in self.index:
                             self.index[bc] = []
@@ -230,15 +229,12 @@ class BarcodeDB:
         if os.path.exists(INDEX_FILE):
             with open(INDEX_FILE, 'r') as f:
                 data = json.load(f)
-            # Convert old format (barcode -> dict) to new format (barcode -> list)
             if data and isinstance(next(iter(data.values())), dict):
                 logger.info("Converting old index format to multi-product format...")
                 new_index = {}
                 for bc, prod in data.items():
-                    # prod was a dict with 'name', 'image', 'shard'
                     new_index[bc] = [prod]
                 self.index = new_index
-                # Save new format
                 with open(INDEX_FILE, 'w') as f:
                     json.dump(self.index, f, indent=2)
                 logger.info("Conversion complete.")
@@ -282,7 +278,7 @@ class BarcodeDB:
         except Exception as e:
             logger.warning(f"Background caching failed for {barcode}: {e}")
 
-    # ---------- ADD: allows multiple products per barcode, but prevents exact duplicate (same barcode+name) ----------
+    # ---------- ADD: allows multiple products per barcode, prevents exact duplicate (same barcode+name) ----------
     def add(self, barcode, name, image, validate=True):
         clean_img = self._extract_url(image)
         safe_barcode = sanitize_csv_field(barcode)
@@ -301,11 +297,9 @@ class BarcodeDB:
                     if prod['name'] == safe_name:
                         return False, f"Product with barcode '{raw_barcode}' and name '{safe_name}' already exists."
 
-            # If barcode not present, create new list
             if raw_barcode not in self.index:
                 self.index[raw_barcode] = []
 
-            # Append new product
             new_product = {
                 'name': safe_name,
                 'image': clean_img,
@@ -313,7 +307,6 @@ class BarcodeDB:
             }
             self.index[raw_barcode].append(new_product)
 
-            # Write to CSV (each product as separate row)
             if self.active_count >= SHARD_LIMIT:
                 self._create_new_shard()
             with open(self.active_shard, 'a', newline='', encoding='utf-8') as f:
@@ -321,16 +314,112 @@ class BarcodeDB:
                 writer.writerow([safe_barcode, safe_name, clean_img])
             self.active_count += 1
 
-            # Save index
             with open(INDEX_FILE, 'w') as f:
                 json.dump(self.index, f, indent=2)
 
-            # Async image cache
             if clean_img:
                 executor.submit(self._cache_image_async, clean_img, raw_barcode)
 
             logger.info(f"Product added: {raw_barcode} -> {safe_name}")
             return True, "OK"
+
+    # ---------- UPDATE: edit product name and/or image ----------
+    def update(self, barcode, product_index, new_name=None, new_image=None, validate=True):
+        """
+        Update a specific product (by index in the list) for a barcode.
+        Returns (success, message, updated_product_dict)
+        """
+        raw_barcode = barcode.strip()
+        with self.lock:
+            if raw_barcode not in self.index:
+                return False, f"Barcode '{raw_barcode}' not found.", None
+
+            products = self.index[raw_barcode]
+            if product_index < 0 or product_index >= len(products):
+                return False, f"Invalid product index. Must be between 0 and {len(products)-1}.", None
+
+            prod = products[product_index]
+            # Determine new values (keep old if None)
+            final_name = new_name.strip() if new_name is not None and new_name.strip() != '' else prod['name']
+            if new_image is not None and new_image.strip() != '':
+                clean_img = self._extract_url(new_image)
+                if validate and clean_img:
+                    is_valid, err_msg = validate_image_url(clean_img)
+                    if not is_valid:
+                        return False, f"Image validation failed: {err_msg}", None
+                final_image = clean_img
+            else:
+                final_image = prod['image']
+
+            # Check if we're actually changing anything
+            if final_name == prod['name'] and final_image == prod['image']:
+                return False, "No changes detected.", None
+
+            # Update the product in index
+            prod['name'] = final_name
+            prod['image'] = final_image
+
+            # Save index
+            with open(INDEX_FILE, 'w') as f:
+                json.dump(self.index, f, indent=2)
+
+            # Rewrite all CSV shards from index
+            self._rewrite_all_shards()
+
+            # Clear cache for this barcode so lookup gets fresh data
+            cache.delete(raw_barcode)
+
+            logger.info(f"Product updated: {raw_barcode} index {product_index} -> {final_name}")
+            return True, "Update successful.", prod
+
+    def _rewrite_all_shards(self):
+        """
+        Rewrite all CSV shards from the current index.
+        This ensures CSV files are always in sync with index.
+        """
+        # Delete existing shard files
+        shard_files = glob.glob(os.path.join(DATA_DIR, "my_products_*.csv"))
+        for f in shard_files:
+            try:
+                os.remove(f)
+            except:
+                pass
+
+        # Re-create shards from index
+        all_products = self.get_all()  # flattened list of dicts with barcode, product_name, image_url
+        if not all_products:
+            # If no products, create an empty shard
+            self._create_new_shard()
+            return
+
+        # Write products in batches of SHARD_LIMIT
+        batch = []
+        shard_idx = 0
+        for prod in all_products:
+            batch.append([prod['barcode'], prod['product_name'], prod['image_url']])
+            if len(batch) >= SHARD_LIMIT:
+                self._write_shard_from_list(shard_idx, batch)
+                shard_idx += 1
+                batch = []
+        if batch:
+            self._write_shard_from_list(shard_idx, batch)
+
+        # Update active_shard and active_count
+        shard_files = glob.glob(os.path.join(DATA_DIR, "my_products_*.csv"))
+        if shard_files:
+            shard_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+            self.active_shard = shard_files[-1]
+            with open(self.active_shard, 'r', encoding='utf-8') as f:
+                self.active_count = sum(1 for _ in f) - 1
+        else:
+            self._create_new_shard()
+
+    def _write_shard_from_list(self, idx, rows):
+        shard_path = os.path.join(DATA_DIR, f"my_products_{idx}.csv")
+        with open(shard_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['barcode', 'product_name', 'image_url'])
+            writer.writerows(rows)
 
     # ---------- LOOKUP: returns list of products for a barcode ----------
     def lookup(self, barcode):
@@ -394,12 +483,13 @@ def get_image_limit():
 @limiter.limit("30 per second")
 def api_home():
     return jsonify({
-        "message": "Multi-Product Barcode API (same barcode supports multiple products)",
+        "message": "Multi-Product Barcode API (supports edit/update)",
         "auth": "Provide X-API-Key header for POST/Export endpoints.",
         "endpoints": {
             "GET /api/lookup/<barcode>": "Public (returns list of products)",
             "GET /api/lookup/<barcode>/image": "Public (downloads first product's image)",
             "POST /api/add": "🔒 Requires Key (async background cache)",
+            "PUT /api/update/<barcode>": "🔒 Requires Key (update product)",
             "GET /api/all": "Public (rate limited)",
             "GET /api/export": "🔒 Requires Key (ZIP download)",
             "GET /api/metrics": "Public (server performance)"
@@ -429,15 +519,44 @@ def api_add_product():
         "shard": os.path.basename(db.active_shard)
     })
 
+@app.route('/api/update/<barcode>', methods=['PUT'])
+@limiter.limit("5 per second", key_func=get_custom_key)
+@require_api_key
+def api_update_product(barcode):
+    start = time.time()
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Send JSON payload."}), 400
+
+    product_index = data.get('index')  # which product in the list (0-based)
+    if product_index is None:
+        return jsonify({"error": "Product index is required."}), 400
+    try:
+        idx = int(product_index)
+    except:
+        return jsonify({"error": "Index must be an integer."}), 400
+
+    new_name = data.get('name')
+    new_image = data.get('image')
+
+    success, msg, updated = db.update(barcode, idx, new_name, new_image, validate=True)
+    if not success:
+        return jsonify({"error": msg}), 400
+
+    update_metrics(start)
+    return jsonify({
+        "status": "ok",
+        "message": "Product updated successfully.",
+        "updated_product": updated
+    })
+
 @app.route('/api/lookup/<barcode>')
 @limiter.limit(get_lookup_limit, key_func=get_custom_key)
 def api_lookup_product(barcode):
     start = time.time()
-    # Check cache for this barcode (store list in cache)
     cached = cache.get(barcode)
     if cached is not None:
         update_metrics(start, cache_hit=True)
-        # cached is the list of products
         return jsonify({
             "barcode": barcode,
             "products": cached
@@ -445,7 +564,6 @@ def api_lookup_product(barcode):
 
     products = db.lookup(barcode)
     if products:
-        # Cache the list (products is list of dicts)
         cache.set(barcode, products, timeout=3600)
         update_metrics(start, cache_hit=False)
         return jsonify({
@@ -462,7 +580,6 @@ def api_download_image(barcode):
     products = db.lookup(barcode)
     if not products:
         return jsonify({"error": "Barcode not found."}), 404
-    # Use the first product's image (you may want to handle multiple images)
     first = products[0]
     img_url = first.get('image', '')
     if not img_url:
@@ -535,7 +652,7 @@ def get_metrics():
         "cache_hit_ratio": round(metrics['cache_hits'] / max(1, metrics['total_requests']) * 100, 2),
         "avg_response_time_ms": round(metrics['avg_response_time'], 2),
         "active_shard": os.path.basename(db.active_shard),
-        "total_entries": len(db.index)  # number of unique barcodes
+        "total_entries": len(db.index)
     })
 
 # ==================== REDIRECTS ====================
@@ -551,6 +668,84 @@ def redirect_add(): return api_add_product()
 def redirect_all(): return redirect('/api/all')
 @app.route('/export')
 def redirect_export(): return redirect('/api/export')
+
+# ==================== CLI INTERACTIVE EDIT ====================
+def interactive_edit():
+    print("\n--- Edit Product (Update name or image) ---")
+    barcode = input("Enter barcode to edit: ").strip()
+    if not barcode:
+        print("❌ Barcode cannot be empty.")
+        return
+
+    products = db.lookup(barcode)
+    if not products:
+        print(f"❌ No products found for barcode '{barcode}'.")
+        return
+
+    if len(products) == 1:
+        idx = 0
+        prod = products[0]
+        print(f"\n📦 Editing single product:")
+        print(f"  Name : {prod['name']}")
+        print(f"  Image: {prod['image']}")
+    else:
+        print(f"\n📋 Found {len(products)} products for barcode '{barcode}':")
+        for i, p in enumerate(products):
+            print(f"  [{i}] {p['name']} (Image: {p['image'][:50]}...)")
+        try:
+            idx = int(input("Select product index to edit: ").strip())
+            if idx < 0 or idx >= len(products):
+                print("❌ Invalid index.")
+                return
+        except ValueError:
+            print("❌ Please enter a valid number.")
+            return
+        prod = products[idx]
+
+    print(f"\n📌 Current data for selected product:")
+    print(f"  Name : {prod['name']}")
+    print(f"  Image: {prod['image']}")
+
+    new_name = input("\nNew name (press Enter to keep unchanged): ").strip()
+    new_image = input("New image URL (press Enter to keep unchanged): ").strip()
+
+    if not new_name and not new_image:
+        print("ℹ️ No changes provided. Exiting.")
+        return
+
+    success, msg, updated = db.update(barcode, idx, new_name, new_image, validate=True)
+    if success:
+        print(f"✅ {msg}")
+        print(f"📦 Updated product: {updated}")
+    else:
+        print(f"❌ Failed: {msg}")
+
+# ==================== NEW: CLI LIST ALL PRODUCTS ====================
+def list_all_products():
+    """Display all products in a formatted table in the terminal."""
+    products = db.get_all()
+    if not products:
+        print("\n📭 No products found in the database.")
+        return
+
+    print(f"\n📋 Total Products: {len(products)}")
+    print("=" * 150)
+    # Header
+    print(f"{'Barcode':<20} | {'Product Name':<50} | {'Image URL'}")
+    print("-" * 150)
+
+    # Data rows
+    for p in products:
+        barcode = p['barcode']
+        name = p['product_name']
+        image = p['image_url']
+        # Truncate long names for better display
+        if len(name) > 48:
+            name = name[:45] + "..."
+        print(f"{barcode:<20} | {name:<50} | {image}")
+
+    print("=" * 150)
+    print(f"✅ Total {len(products)} products displayed.")
 
 # ==================== CLI MANAGEMENT ====================
 def interactive_add():
@@ -632,12 +827,18 @@ if __name__ == '__main__':
             manage_keys()
         elif sys.argv[1] == '--add':
             interactive_add()
+        elif sys.argv[1] == '--edit':
+            interactive_edit()
+        elif sys.argv[1] == '--list':
+            list_all_products()
         elif sys.argv[1] == '--stats':
             show_stats()
         else:
-            print("Unknown command. Available: --add, --stats, --add-key, --remove-key, --list-keys")
+            print("Unknown command. Available: --add, --edit, --list, --stats, --add-key, --remove-key, --list-keys")
     else:
-        print(f"🚀 Multi-Product Barcode Server running at: http://localhost:5000")
+        print(f"🚀 Multi-Product Barcode Server with Edit support running at: http://localhost:5000")
         print(f"🔑 Use 'X-API-Key' header for secure endpoints.")
         print(f"📊 Manage keys via CLI: --add-key, --remove-key, --list-keys")
+        print(f"📝 Edit product: python barcode_server.py --edit")
+        print(f"📋 List all products: python barcode_server.py --list")
         app.run(host='0.0.0.0', port=5000, debug=False)
