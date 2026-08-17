@@ -54,5 +54,103 @@
       "image": "https://i.im.ge/QMpY6ef/Cocola_Chocolate_Roll.jpg",
       "shard": "my_products_0.csv"
     }
+  ],
+  "8941155001097": [
+    {
+      "name": "Cocola Cup Noodles",
+      "image": "https://i.im.ge/QMvwSH1/Cocola_Cup_Noodles.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "6271006776600": [
+    {
+      "name": "Johnsons Baby Soft Lotion 500ml",
+      "image": "https://i.im.ge/QMvEbo1/Johnsons_Baby_Soft_Lotion_500ml.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "0813903000042": [
+    {
+      "name": "ACI Aerosol Insect Spray 800ml",
+      "image": "https://i.im.ge/QMvEnBy/ACI_Aerosol_Insect_Spray_800ml.png",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "6291100761616": [
+    {
+      "name": "Johnson's Baby Cologne Morning Dew",
+      "image": "https://i.im.ge/QMv3dDJ/Johnson_s_Baby_Cologne_Morning_Dew.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "8801962686552": [
+    {
+      "name": "Mum Driking Water 5ltr",
+      "image": "https://i.im.ge/QMvRsJ8/Mum_Driking_Water_5ltr.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "3574669907545": [
+    {
+      "name": "Johnson\u2019s Baby Shampoo 500 ml",
+      "image": "https://i.pinimg.com/1200x/9b/0c/74/9b0c743f2a44bb68e210f4c7c7ff67af.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "7622201128395": [
+    {
+      "name": "Tang Mango Powder Fruit Drink 2Kg",
+      "image": "https://i.pinimg.com/1200x/d7/b0/e0/d7b0e014926ffc7e331526b2227c1a56.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "7622300470074": [
+    {
+      "name": "Tang Powder Drink Mango 2.5Kg",
+      "image": "https://images.openfoodfacts.org/images/products/762/230/047/0074/front_fr.3.400.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "8941153055108": [
+    {
+      "name": "Funtastic Vanilla Plain Cup Cake 10 gm",
+      "image": "https://i.im.ge/QMvvevT/Funtastic_Vanilla_Plain_Cup_Cake_10_gm.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "7622201128456": [
+    {
+      "name": "Tang Orange Powder Fruit Drink 2Kg",
+      "image": "https://i.im.ge/QMvJiDY/Tang_Orange_Powder_Fruit_Drink_2Kg.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "8513690411602": [
+    {
+      "name": "Tibet Luxury Talcum Powder 100gm",
+      "image": "https://i.im.ge/QMvJhMM/Tibet_Luxury_Talcum_Powder_100gm.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "8991111101965": [
+    {
+      "name": "Johnsons Baby Powder 300g",
+      "image": "https://i.im.ge/QMvJCIr/Johnsons_Baby_Powder_300g.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "8941100511374": [
+    {
+      "name": "Radhuni Biryani Masala - 40g",
+      "image": "https://www.sfbl.com.bd/uploaded_files/300tn_thumb_BIRIYANI.PNG",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "8941149791072": [
+    {
+      "name": "Mr. White Detergent Powder 500gm",
+      "image": "https://i.pinimg.com/1200x/d5/74/7a/d5747a4655227052d98d7f7b4786e9fb.jpg",
+      "shard": "my_products_0.csv"
+    }
   ]
 }
