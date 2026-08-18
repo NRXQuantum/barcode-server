@@ -152,5 +152,33 @@
       "image": "https://i.pinimg.com/1200x/d5/74/7a/d5747a4655227052d98d7f7b4786e9fb.jpg",
       "shard": "my_products_0.csv"
     }
+  ],
+  "8901023010002": [
+    {
+      "name": "HIT ANTI ROACH GEL 20gm",
+      "image": "https://i.im.ge/QMnXArY/HIT_ANTI_ROACH_GEL_20gm.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "8941149751120": [
+    {
+      "name": "Finis Cockroach Killer Powder 40gm",
+      "image": "https://i.im.ge/QMnFht9/Finis_Cockroach_Killer_Powder_40gm.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "8941149751113": [
+    {
+      "name": "Finis Cockroach Killer Powder 80gm",
+      "image": "https://i.im.ge/QMnOIXm/Finis_Cockroach_Killer_Powder_80gm.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ],
+  "8946000000379": [
+    {
+      "name": "Chu.Chu Wet Wipes Tissue 220 Pcs",
+      "image": "https://i.im.ge/QMnOtiy/Chu_Chu_Wet_Wipes_Tissue_220_Pcs.jpg",
+      "shard": "my_products_0.csv"
+    }
   ]
 }
