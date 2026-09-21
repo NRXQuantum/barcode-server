@@ -1,362 +1,431 @@
-# Secure Barcode API Server
 
-A Python/Flask barcode API and command-line tool for storing product names and image URLs against barcodes. The application supports multiple products per barcode, API-key authentication, configurable lookup/image limits, sharded CSV storage, JSON indexing, image validation, background image caching, ZIP export, metrics, and interactive product management.
+<div align="center">
 
-> **Security warning:** Never use real API keys in source control. If a key has been committed, revoke it and create a new one immediately.
+# ◆ Barcode Server
 
-## Contents
+**A production-grade REST API & CLI for storing products, barcodes, and images.**
 
-- [Features](#features)
-- [Project structure](#project-structure)
-- [Requirements and installation](#requirements-and-installation)
-- [Running the server](#running-the-server)
-- [First startup behavior](#first-startup-behavior)
-- [CLI commands](#cli-commands)
-- [Authentication and API keys](#authentication-and-api-keys)
-- [REST API](#rest-api)
-- [Rate limits](#rate-limits)
-- [Storage model](#storage-model)
-- [Caching and background image work](#caching-and-background-image-work)
-- [Security behavior](#security-behavior)
-- [Configuration](#configuration)
-- [Metrics](#metrics)
-- [Errors and status codes](#errors-and-status-codes)
-- [Troubleshooting](#troubleshooting)
-- [Production notes](#production-notes)
-- [Contributing](#contributing)
-- [License](#license)
+Fast · Secure · Self-hosted · Zero-config
 
-## Features
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
+[![Flask](https://img.shields.io/badge/flask-2.x-black)](https://flask.palletsprojects.com/)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-green)](LICENSE)
+[![Status](https://img.shields.io/badge/status-stable-brightgreen)]()
+[![PRs](https://img.shields.io/badge/PRs-welcome-blueviolet)]()
 
-- Public barcode lookup.
-- Multiple products under the same barcode.
-- Protected product creation, product updates, and ZIP export.
-- Interactive CLI for adding, editing, listing, and inspecting products.
-- CLI API-key creation, removal, and listing.
-- Per-key lookup and image-download limits.
-- CSV shards that rotate after 10,000 data rows.
-- JSON index for fast in-memory lookup.
-- One-hour lookup cache and 24-hour image cache.
-- Background image prefetch after adding a product.
-- Image URL validation and private-network checks.
-- CSV formula/injection mitigation when adding products.
-- Runtime metrics and compressed CSV export.
+[▸ Quick Start](#-quick-start) &nbsp;·&nbsp; [▸ Features](#-features) &nbsp;·&nbsp; [▸ API Reference](#-api-reference) &nbsp;·&nbsp; [▸ FAQ](#-faq) &nbsp;·&nbsp; [▸ Contributing](#-contributing)
 
-## Project structure
+</div>
 
-```text
-.
-├── barcode_server.py       # Flask app, storage layer, API routes, CLI commands
-├── render.py               # Optional Render self-ping runner
-├── requirements.txt        # Python dependencies
-├── README.md               # Documentation
-└── barcode_data/
-    ├── api_keys.json       # API-key configuration
-    ├── index.json          # Barcode-to-products index
-    └── my_products_0.csv   # Product storage shard
+---
+
+## ◈ What is this?
+
+A lightweight, self-hosted server that maps **barcodes → products → images**. It exposes a REST API and a CLI so you can add, look up, search, update, and delete product records — all backed by simple CSV shards and a JSON index.
+
+**Perfect for:**
+
+- ▸ Inventory management systems
+- ▸ Mobile shopping apps (barcode scanners)
+- ▸ Point-of-sale (POS) software
+- ▸ Product lookup services
+- ▸ Warehouse tools
+
+**Not intended for:**
+
+- ✕ Multi-tenant SaaS (single-writer design)
+- ✕ Distributed deployments (no shared state)
+- ✕ Terabyte-scale data (use PostgreSQL instead)
+
+---
+
+## ▸ Quick Start
+
+**Get running in 60 seconds.**
+
+```bash
+# 1. Clone & install
+git clone https://github.com/NRXQuantum/barcode-server.git
+cd barcode-server
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+# 2. Set your first API key
+export BARCODE_API_KEY="my-super-secret-key-change-me"
+
+# 3. Run
+python barcode_server.py
 ```
 
-`barcode_data/` is runtime data. Back up `index.json`, `api_keys.json`, and all `my_products_*.csv` files together.
+Server is live at http://localhost:5000
 
-## Requirements and installation
+Test it:
 
-Python 3.8 or newer is recommended.
+```bash
+# Add a product
+curl -X POST http://localhost:5000/api/add \
+  -H "X-API-Key: my-super-secret-key-change-me" \
+  -H "Content-Type: application/json" \
+  -d '{"barcode":"1234567890","name":"Coca Cola 500ml","image":"https://example.com/coke.jpg"}'
+
+# Look it up (no auth required)
+curl http://localhost:5000/api/lookup/1234567890
+
+# See server stats
+python barcode_server.py --stats
+```
+
+---
+
+▤ Table of Contents
+
+<details>
+<summary><b>Click to expand full navigation</b></summary>
+
+Getting Started
+
+· What is this?
+· Quick Start
+· Requirements & Installation
+· Running the Server
+
+Understanding the System
+
+· Architecture Overview
+· Storage Model
+· Image Delivery Modes
+· First Startup Behavior
+
+Using the Server
+
+· CLI Commands
+· API Reference
+· Common Workflows
+· Authentication
+· Rate Limits
+
+Operations
+
+· Configuration
+· Security Model
+· Metrics & Health
+· Deployment
+· Backup & Recovery
+
+Reference
+
+· Error Codes
+· FAQ
+· Troubleshooting
+· Contributing
+
+</details>
+
+---
+
+▣ Features
+
+Core
+
+Symbol Feature Description
+◆ Public Lookup Anyone can query barcodes — no auth needed
+▣ Multi-Product One barcode can hold multiple products
+▤ Sharded CSV Storage Auto-rotates at 10,000 rows per shard
+◎ In-Memory Index Sub-millisecond lookups from JSON index
+✦ Protected Writes Add/update/delete require API key
+
+Advanced
+
+Symbol Feature Description
+◈ Hybrid Images 302 redirect by default; proxy fallback
+▤ Pagination /api/all?page=1&per_page=50
+▸ Search Match by name or barcode
+▣ Bulk Operations Up to 100 items per batch
+■ Safe Delete Index-based, audit-logged, confirm header
+◎ Health & Stats JSON endpoints for monitoring
+✦ CSV Injection Guard Blocks + - = @ prefixes
+✦ IPv4 + IPv6 Safe Rejects private/reserved addresses
+
+---
+
+▤ Architecture Overview
+
+```
+┌─────────────┐       ┌──────────────────────┐       ┌─────────────────┐
+│   Client    │──────▶│  Flask API Server    │──────▶│  CSV Shards     │
+│  (App/Web)  │◀──────│  (barcode_server.py) │◀──────│  + JSON Index   │
+└─────────────┘       └──────────────────────┘       └─────────────────┘
+                             │
+                             │ image mode = redirect
+                             ▼
+                      ┌──────────────────┐
+                      │  External Image  │
+                      │      Source      │
+                      └──────────────────┘
+```
+
+Data flow:
+
+1. Add — Validate image URL → Append to active CSV shard → Update JSON index → Cache in background
+2. Lookup — Check memory cache → Fall back to in-memory index → Return list of products
+3. Image — Return 302 to original URL (fast) or stream via proxy (fallback)
+4. Delete — Verify API key + confirm header → Remove indices → Rewrite shards → Log to audit
+
+---
+
+▤ Requirements & Installation
+
+Minimum: Python 3.8+
 
 ```bash
 git clone https://github.com/NRXQuantum/barcode-server.git
 cd barcode-server
 
 python -m venv .venv
+source .venv/bin/activate          # Linux/macOS
+# .venv\Scripts\Activate.ps1       # Windows PowerShell
 
-# Linux/macOS
-source .venv/bin/activate
-
-# Windows PowerShell
-# .venv\Scripts\Activate.ps1
-
-python -m pip install --upgrade pip
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-The dependencies are Flask, Flask-Limiter, Flask-Caching, Requests, and Gunicorn.
+Dependencies:
 
-## Running the server
+Package Purpose
+flask Web framework
+flask-limiter Rate limiting
+flask-caching In-memory cache
+requests Image URL validation & download
+gunicorn Production WSGI server
 
-### Development server
+---
+
+▸ Running the Server
+
+Development
 
 ```bash
 python barcode_server.py
+# → http://localhost:5000
 ```
 
-The application listens on `http://localhost:5000` and binds to `0.0.0.0`.
-
-### Production WSGI server
+Production (Gunicorn)
 
 ```bash
 gunicorn --workers 2 --bind 0.0.0.0:5000 barcode_server:app
 ```
 
-The current cache, metrics, rate limiter, and local file storage are process-local. Multiple workers do not share their in-memory state and should not independently write the same data directory without an external coordination strategy.
+Warning — multi-worker setups: Each worker keeps its own cache, metrics, and rate limiter. They do not share state. For multi-worker setups use Redis for cache and rate limits, and a proper database.
 
-### Render runner
+Render.com (self-pinging)
 
 ```bash
 python render.py
 ```
 
-`render.py` starts the Flask development server and a daemon thread that requests `/api/` every 12 minutes. It uses `PORT` for the listening port and `RENDER_EXTERNAL_URL` for the ping target. This self-ping is optional and should not be treated as a replacement for health checks or production WSGI configuration.
+Pings /api/ every 12 minutes to keep the free instance alive.
 
-## First startup behavior
+---
 
-When the application starts:
+▤ Storage Model
 
-1. `barcode_data/` is created if necessary.
-2. If `barcode_data/api_keys.json` does not exist, an initial key is created from `BARCODE_API_KEY`; otherwise the code's fallback value is used.
-3. `barcode_data/index.json` is loaded if present.
-4. If no shard exists, `my_products_0.csv` is created.
-5. A legacy root-level `my_products.csv` may be migrated when no index exists.
-6. An older single-product index format is converted to the current list-per-barcode format.
+Directory Layout
 
-Set the initial key before the first run:
-
-```bash
-# Linux/macOS
-export BARCODE_API_KEY="replace-with-a-long-random-secret"
-
-# Windows PowerShell
-# $env:BARCODE_API_KEY = "replace-with-a-long-random-secret"
+```
+barcode_data/
+├── index.json              # barcode → [products]
+├── api_keys.json           # API key registry
+├── deletion_audit.log      # every delete (success + failure)
+├── my_products_0.csv       # shard (10k rows max)
+└── my_products_1.csv       # next shard (auto-created)
 ```
 
-`BARCODE_API_KEY` is only used to create the initial file. It does not replace keys already stored in `barcode_data/api_keys.json`.
-
-## CLI commands
-
-Run commands from the repository root. The program does not currently provide an argparse-based `--help` command; the supported commands are listed below.
-
-### Add products interactively: `--add`
-
-```bash
-python barcode_server.py --add
-```
-
-The program asks for:
-
-```text
-Barcode:
-Product Name:
-Image URL (optional):
-Add another? (y/n):
-```
-
-Behavior:
-
-- Empty barcode and empty product name are rejected.
-- The image URL is optional.
-- Multiple products may use the same barcode.
-- The same barcode and product name cannot be added twice.
-- A supplied image URL is validated before it is stored.
-- Image caching is submitted to the background executor after a successful add.
-- Type `y` to continue adding products; any other answer ends the loop.
-
-### Edit a product interactively: `--edit`
-
-```bash
-python barcode_server.py --edit
-```
-
-Behavior:
-
-- Enter a barcode first.
-- If there are multiple products, select a zero-based index such as `0` or `1`.
-- Press Enter for the new name to keep the existing name.
-- Press Enter for the new image URL to keep the existing image.
-- Leaving both fields empty cancels the update.
-- A changed image is validated before saving.
-- The update rewrites all CSV shards from the current JSON index.
-- The barcode lookup cache is cleared after a successful update.
-
-### List all products: `--list`
-
-```bash
-python barcode_server.py --list
-```
-
-Prints a terminal table containing the barcode, product name, and image URL. Long product names are shortened for display. This command shows the total number of product records, not only unique barcodes.
-
-### Show storage statistics: `--stats`
-
-```bash
-python barcode_server.py --stats
-```
-
-Displays:
-
-- Unique barcodes.
-- Total products, including multiple products under one barcode.
-- Number of CSV shards.
-- Active shard name and row count.
-
-### Add an API key: `--add-key`
-
-```bash
-python barcode_server.py \
-  --add-key "APP_KEY" \
-  --name "Android App" \
-  --limits "lookup:500,image:20,add:10"
-```
-
-Required arguments:
-
-- `--add-key <key>`
-- `--name <name>`
-
-Optional argument:
-
-- `--limits lookup:number,image:number,add:number`
-
-Example with default limits:
-
-```bash
-python barcode_server.py --add-key "APP_KEY" --name "Internal Tool"
-```
-
-If the key already exists, the command returns `Key already exists.`. Invalid limit syntax is ignored with a warning. The configured `lookup` and `image` values are used by the dynamic lookup/image limit functions. The current `/api/add` and `/api/update/<barcode>` routes still use a fixed `5 per second` route limit; the stored `add` value is not currently used by those decorators.
-
-Do not use an artificially large or “unlimited” key in a public or untrusted environment.
-
-### Remove an API key: `--remove-key`
-
-```bash
-python barcode_server.py --remove-key "APP_KEY"
-```
-
-Removes the key from `barcode_data/api_keys.json`. If it does not exist, the command returns `Key not found.`.
-
-### List API keys: `--list-keys`
-
-```bash
-python barcode_server.py --list-keys
-```
-
-Displays each key in masked form, its name, enabled status, and configured limits. The command does not provide a command to enable or disable a key; that currently requires editing the JSON configuration carefully or adding such functionality to the code.
-
-### Unsupported or unknown commands
-
-```bash
-python barcode_server.py --unknown
-```
-
-The program prints the supported command names. There is no built-in `--help` parser at present.
-
-## Authentication and API keys
-
-Protected endpoints require the `X-API-Key` header:
-
-```bash
-curl -H "X-API-Key: YOUR_API_KEY" \
-  http://localhost:5000/api/export
-```
-
-Each key record has this shape:
+JSON Index Format
 
 ```json
 {
-  "name": "Application name",
-  "enabled": true,
-  "limits": {
-    "lookup": 200,
-    "image": 5,
-    "add": 5
-  }
-}
-```
-
-- Missing key: `401` with `Missing X-API-Key header.`
-- Unknown key: `401` with `Invalid API Key.`
-- Disabled key: `403` with `API Key is disabled.`
-- Keys are stored as plaintext JSON by the current implementation.
-- Key changes are loaded from the file during requests, but the file is not encrypted or atomically updated.
-
-## REST API
-
-Base URL:
-
-```text
-http://localhost:5000/api
-```
-
-### Endpoint summary
-
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| `GET` | `/api/` | No | API information and endpoint list |
-| `GET` | `/api/lookup/<barcode>` | No | Return all products for a barcode |
-| `GET` | `/api/lookup/<barcode>/image` | No | Download the first product image |
-| `POST` | `/api/add` | Yes | Add a product |
-| `PUT` | `/api/update/<barcode>` | Yes | Update one product by index |
-| `GET` | `/api/all` | No | Return all products |
-| `GET` | `/api/export` | Yes | Download all CSV shards as a ZIP |
-| `GET` | `/api/metrics` | No | Return process-local metrics |
-
-### `GET /api/`
-
-```bash
-curl http://localhost:5000/api/
-```
-
-Returns the API description and endpoint list.
-
-### `GET /api/lookup/<barcode>`
-
-```bash
-curl http://localhost:5000/api/lookup/6281006451865
-```
-
-Response:
-
-```json
-{
-  "barcode": "6281006451865",
-  "products": [
+  "6281006451865": [
     {
-      "name": "Example Product",
-      "image": "https://example.com/product.jpg",
+      "name": "Paracetamol 500mg",
+      "image": "https://example.com/p.jpg",
       "shard": "my_products_0.csv"
     }
   ]
 }
 ```
 
-`products` is always a list when the barcode exists. If it does not exist:
+CSV Shard Format
 
-```json
-{"error":"Barcode not found."}
+```csv
+barcode,product_name,image_url
+6281006451865,Paracetamol 500mg,https://example.com/p.jpg
 ```
 
-### `GET /api/lookup/<barcode>/image`
+Rules
+
+Rule Value
+Max rows per shard 10,000
+Duplicate detection Same barcode + same name
+Index location barcode_data/index.json
+Audit log Append-only
+
+---
+
+◈ Image Delivery Modes
+
+Two modes are available. The default is redirect.
+
+■ Mode A — Redirect (default, recommended)
+
+```
+Client → API: "Give me image for 12345"
+API    → Client: "302 → https://source.com/img.jpg"
+Client → source.com: "Give me the image"
+source.com → Client: [image bytes]
+```
+
+· ▸ Near-zero server load
+· ▸ Unlimited concurrency
+· ▸ Blocked by hotlink-protected sites
+
+■ Mode B — Proxy (fallback)
+
+```
+Client → API: "Give me image for 12345 (?proxy=1)"
+API    → source.com: "Give me the image"
+source.com → API: [image bytes]
+API    → Client: [image bytes]
+```
+
+· ▸ Works everywhere
+· ▸ Uses server bandwidth + RAM
+
+Use proxy when:
+
+· The source blocks hotlinking (Amazon, Flipkart)
+· The URL requires authentication headers
+· You need to hide the source URL
+
+Switch mode:
 
 ```bash
-curl -OJ http://localhost:5000/api/lookup/6281006451865/image
+# Per-request
+curl "http://localhost:5000/api/lookup/12345/image?proxy=1"
+
+# Global default (edit source)
+IMAGE_MODE = 'proxy'
 ```
 
-If a barcode has multiple products, this endpoint downloads only the image of the first product (`products[0]`). It returns `404` when the barcode or image is missing.
+---
 
-### `POST /api/add`
+▸ CLI Commands
 
-Requires an API key and JSON body. `barcode` and `name` are required; `image` is optional.
+All commands run from the repo root.
+
+Add products
+
+```bash
+python barcode_server.py --add
+```
+
+Interactive prompts: barcode → name → optional image URL.
+
+Edit a product
+
+```bash
+python barcode_server.py --edit
+```
+
+Select by barcode + index. Press Enter to keep the current value.
+
+List all products
+
+```bash
+python barcode_server.py --list
+```
+
+Table: barcode | name | image URL.
+
+Show dashboard stats
+
+```bash
+python barcode_server.py --stats
+```
+
+Colored dashboard: products, images, storage, active shard, API keys.
+
+API key management
+
+```bash
+# Add
+python barcode_server.py --add-key "NEW_KEY" \
+  --name "Android App" \
+  --limits "lookup:500,image:20,add:10"
+
+# Remove
+python barcode_server.py --remove-key "OLD_KEY"
+
+# List
+python barcode_server.py --list-keys
+```
+
+---
+
+▸ API Reference
+
+Base URL: http://localhost:5000/api
+
+Endpoint Summary
+
+Method Endpoint Auth Purpose
+GET /api/ — API info
+GET /api/lookup/<bc> — Get all products
+GET /api/lookup/<bc>/image — Get first product's image
+POST /api/lookup-batch — Bulk lookup (≤100)
+GET /api/all — List all (paginated)
+GET /api/search?q=<text> — Search name or barcode
+POST /api/add ✦ Add product
+POST /api/add-batch ✦ Bulk add (≤100)
+PUT /api/update/<bc> ✦ Update by index
+DELETE /api/delete/<bc> ✦ Delete indices
+GET /api/export ✦ Download CSV ZIP
+GET /api/metrics — Server metrics
+GET /api/stats — JSON dashboard
+GET /api/health — Health check
+
+▸ GET /api/lookup/&lt;barcode&gt;
+
+Public. Returns every product registered under the barcode.
+
+```bash
+curl http://localhost:5000/api/lookup/6281006451865
+```
+
+```json
+{
+  "barcode": "6281006451865",
+  "products": [
+    {
+      "name": "Paracetamol 500mg",
+      "image": "https://example.com/p.jpg",
+      "shard": "my_products_0.csv"
+    }
+  ]
+}
+```
+
+Errors: 404 if the barcode is not found.
+
+▸ POST /api/add
+
+Requires X-API-Key.
 
 ```bash
 curl -X POST http://localhost:5000/api/add \
-  -H "X-API-Key: YOUR_API_KEY" \
+  -H "X-API-Key: YOUR_KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "barcode": "6281006451865",
-    "name": "Example Product",
-    "image": "https://example.com/product.jpg"
-  }'
+  -d '{"barcode":"123","name":"Product","image":"https://..."}'
 ```
-
-Successful response:
 
 ```json
 {
@@ -366,66 +435,173 @@ Successful response:
 }
 ```
 
-The request may contain text around a URL; the current implementation extracts the first HTTP/HTTPS URL it finds. Duplicate barcode/name combinations and invalid image URLs return `400`.
+The image URL is validated first. Duplicate barcode + name combinations are rejected.
 
-### `PUT /api/update/<barcode>`
+▸ POST /api/add-batch
 
-Requires an API key. `index` is required and is zero-based within the barcode's `products` list.
+Requires X-API-Key. Up to 100 items per call.
 
 ```bash
-curl -X PUT http://localhost:5000/api/update/6281006451865 \
-  -H "X-API-Key: YOUR_API_KEY" \
+curl -X POST http://localhost:5000/api/add-batch \
+  -H "X-API-Key: YOUR_KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "index": 0,
-    "name": "Updated Product Name",
-    "image": "https://example.com/updated.jpg"
-  }'
+  -d '[
+    {"barcode":"111","name":"A"},
+    {"barcode":"222","name":"B"}
+  ]'
 ```
 
-Only `name`, only `image`, or both may be changed. Omitting a field keeps its previous value. An invalid index, missing index, invalid image, or no actual change returns `400`.
+```json
+{
+  "added": 2,
+  "failed": 0,
+  "results": [
+    {"index": 0, "status": "added", "barcode": "111"},
+    {"index": 1, "status": "added", "barcode": "222"}
+  ]
+}
+```
 
-Successful response:
+▸ PUT /api/update/&lt;barcode&gt;
+
+Requires X-API-Key. index is zero-based.
+
+```bash
+curl -X PUT http://localhost:5000/api/update/123 \
+  -H "X-API-Key: YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"index":0,"name":"New Name"}'
+```
+
+Omit a field to keep its old value. Both the lookup cache and the image cache are cleared.
+
+▸ DELETE /api/delete/&lt;barcode&gt;
+
+Requires X-API-Key and X-Confirm-Delete: YES-DELETE.
+
+```bash
+curl -X DELETE http://localhost:5000/api/delete/123 \
+  -H "X-API-Key: YOUR_KEY" \
+  -H "X-Confirm-Delete: YES-DELETE" \
+  -H "Content-Type: application/json" \
+  -d '{"indices":[0,2]}'
+```
 
 ```json
 {
   "status": "ok",
-  "message": "Product updated successfully.",
-  "updated_product": {
-    "name": "Updated Product Name",
-    "image": "https://example.com/updated.jpg",
-    "shard": "my_products_0.csv"
-  }
+  "deleted": 2,
+  "details": [
+    {"index": 0, "status": "deleted", "name": "Product A"},
+    {"index": 2, "status": "deleted", "name": "Product C"}
+  ]
 }
 ```
 
-### `GET /api/all`
+Safety layers:
+
+1. X-API-Key header required
+2. X-Confirm-Delete: YES-DELETE header required
+3. indices array mandatory — no "delete all" option exists
+4. Rate limit: 5 requests per minute
+5. Every delete logged to deletion_audit.log
+
+The barcode itself cannot be deleted — only products under it.
+
+▸ GET /api/search
+
+Public. Searches product names and barcodes with case-insensitive substring matching.
+
+```bash
+curl "http://localhost:5000/api/search?q=para&page=1&per_page=20"
+```
+
+```json
+{
+  "query": "para",
+  "page": 1,
+  "per_page": 20,
+  "total_matches": 5,
+  "total_pages": 1,
+  "items": [
+    {
+      "barcode": "6281006451865",
+      "product_name": "Paracetamol 500mg",
+      "image_url": "https://...",
+      "shard": "my_products_0.csv"
+    }
+  ]
+}
+```
+
+▸ GET /api/all
+
+Public. Flat response when no pagination params are supplied (backward compatible):
 
 ```bash
 curl http://localhost:5000/api/all
 ```
 
-Returns a flattened list. Each item contains `barcode`, `product_name`, `image_url`, and `shard`.
-
-### `GET /api/export`
-
-Requires an API key:
+Paginated response when page or per_page are supplied:
 
 ```bash
-curl -H "X-API-Key: YOUR_API_KEY" \
-  http://localhost:5000/api/export \
-  --output all_shards.zip
+curl "http://localhost:5000/api/all?page=1&per_page=50"
 ```
 
-The ZIP contains the current `my_products_*.csv` files.
+```json
+{
+  "page": 1,
+  "per_page": 50,
+  "total": 356,
+  "total_pages": 8,
+  "items": []
+}
+```
 
-### `GET /api/metrics`
+▸ POST /api/lookup-batch
+
+Public. Up to 100 barcodes per call.
 
 ```bash
-curl http://localhost:5000/api/metrics
+curl -X POST http://localhost:5000/api/lookup-batch \
+  -H "Content-Type: application/json" \
+  -d '["111", "222", "999"]'
 ```
 
-Example response:
+```json
+{
+  "111": [{"name": "A", "image": "...", "shard": "..."}],
+  "222": null,
+  "999": null
+}
+```
+
+▸ GET /api/health
+
+Public. Cheap health endpoint.
+
+```bash
+curl http://localhost:5000/api/health
+```
+
+```json
+{
+  "status": "ok",
+  "uptime": "2h 15m 30s",
+  "uptime_seconds": 8130,
+  "shards": 2,
+  "barcodes": 128,
+  "active_shard": "my_products_1.csv"
+}
+```
+
+▸ GET /api/stats
+
+Public. JSON version of the --stats CLI dashboard. Full example in Metrics & Health.
+
+▸ GET /api/metrics
+
+Public. Process-local metrics.
 
 ```json
 {
@@ -439,213 +615,534 @@ Example response:
 }
 ```
 
-`total_entries` is the number of unique barcode keys, not the number of product rows. Metrics reset when the process restarts and are not shared between workers.
+▸ GET /api/export
 
-### Compatibility redirects
+Requires X-API-Key. Downloads all CSV shards as a ZIP.
 
-The application also exposes `/`, `/lookup/<barcode>`, `/lookup/<barcode>/image`, `/add`, `/all`, and `/export`. Prefer the `/api/...` paths for new clients. The `/add` and `/export` compatibility routes call the protected handlers and therefore still require the appropriate API key.
+```bash
+curl -H "X-API-Key: YOUR_KEY" \
+  http://localhost:5000/api/export -o all_shards.zip
+```
 
-## Rate limits
+---
 
-The current route configuration is:
+◎ Common Workflows
 
-| Operation | Limit |
-|---|---|
-| API home | `30 per second` |
-| Lookup without key | `20 per second` |
-| Lookup with key | The key's `lookup` value per second; fallback `200 per second` if absent |
-| Image without key | `1 per 3 seconds` |
-| Image with key | The key's `image` value per second; fallback `5 per second` if absent |
-| Add | `5 per second` |
-| Update | `5 per second` |
-| All products | `30 per second` |
-| Export | `2 per minute` |
-| Metrics | `10 per minute` |
-| Global defaults | `200 per day` and `50 per hour` where applicable |
+Workflow 1 — Mobile App Integration
 
-The limiter uses `memory://`, so state is process-local and resets after restart. In a multi-worker deployment, workers do not share the limiter state.
+Scenario: Your mobile app scans a barcode and shows product info and an image.
 
-## Storage model
+```
+1. App scans barcode      →  GET /api/lookup/6281006451865
+2. API returns product list
+3. App displays           →  <img src="https://api.example.com/api/lookup/6281006451865/image">
+4. Server returns 302     →  app auto-follows → image loads
+```
 
-### JSON index
+No SDK needed. Works with <img> tags, Glide, SDWebImage, Flutter Image.network, and React Native.
 
-`barcode_data/index.json` maps each barcode to a list:
+Workflow 2 — Admin Bulk Import
+
+```bash
+# Import 500 products in 5 batches
+curl -X POST http://localhost:5000/api/add-batch \
+  -H "X-API-Key: ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d @batch1.json   # up to 100 items each
+```
+
+Workflow 3 — Removing a Bad Entry
+
+```bash
+# 1. Check what's there
+curl http://localhost:5000/api/lookup/12345
+
+# 2. Delete index 1 (the second product)
+curl -X DELETE http://localhost:5000/api/delete/12345 \
+  -H "X-API-Key: ADMIN_KEY" \
+  -H "X-Confirm-Delete: YES-DELETE" \
+  -H "Content-Type: application/json" \
+  -d '{"indices":[1]}'
+
+# 3. Check the audit log
+tail barcode_data/deletion_audit.log
+```
+
+Workflow 4 — Search & Paginate
+
+```bash
+# Find all products with "para" in name or barcode
+curl "http://localhost:5000/api/search?q=para&page=1&per_page=50"
+```
+
+---
+
+✦ Authentication
+
+Protected endpoints require the X-API-Key header.
+
+Key Record Structure
 
 ```json
 {
-  "1234567890123": [
-    {
-      "name": "Product name",
-      "image": "https://example.com/image.jpg",
-      "shard": "my_products_0.csv"
-    }
-  ]
+  "name": "Android App",
+  "enabled": true,
+  "limits": {"lookup": 500, "image": 20, "add": 10}
 }
 ```
 
-### CSV shards
+Response Matrix
 
-Each shard contains:
+Situation Status Body
+Missing key 401 {"error": "Missing X-API-Key header."}
+Unknown key 401 {"error": "Invalid API Key."}
+Disabled key 403 {"error": "API Key is disabled."}
+Delete without confirm header 400 {"error": "Missing or invalid X-Confirm-Delete header."}
 
-```text
-barcode,product_name,image_url
+Rotating Keys
+
+```bash
+# 1. Add new key
+python barcode_server.py --add-key "NEW_KEY" --name "App v2"
+
+# 2. Update client to use the new key
+# 3. Verify the old key is no longer used (check logs)
+# 4. Remove the old key
+python barcode_server.py --remove-key "OLD_KEY"
 ```
 
-The active shard rotates after 10,000 data rows. New products are appended to the active shard and the JSON index is rewritten. The index is loaded into memory at startup for lookups.
+---
 
-### Multiple products and duplicate rule
+▸ Rate Limits
 
-- A barcode may have multiple product records.
-- A duplicate is defined as the same barcode and the same product name.
-- The image URL is not used in the duplicate comparison.
-- Updating a product rewrites all shards from the current index.
-- Do not manually edit the JSON or CSV files while the server is running.
+Endpoint Anonymous With Key
+/api/lookup/<bc> 20/sec Key's lookup (fallback 200/sec)
+/api/lookup/<bc>/image 1 per 3 sec Key's image (fallback 5/sec)
+/api/add — Key's add (fallback 5/sec)
+/api/add-batch — Same as add
+/api/update/<bc> — Same as add
+/api/delete/<bc> — 5/min
+/api/all 30/sec 30/sec
+/api/search 30/sec 30/sec
+/api/export — 2/min
+/api/metrics 10/min 10/min
+/api/health 60/min 60/min
+/api/stats 30/sec 30/sec
 
-### Legacy data
+Rate limits use memory:// and are not shared between Gunicorn workers. Use Redis for distributed deployments.
 
-If a root-level `my_products.csv` exists and the index does not, startup attempts to migrate it to `barcode_data/my_products_0.csv`. An old index containing one object per barcode is converted to a list-per-barcode format.
+---
 
-## Caching and background image work
+▤ Configuration
 
-- Lookup responses are cached for 3,600 seconds.
-- Images are cached for 86,400 seconds under keys such as `img_<barcode>`.
-- Product creation submits image downloading to a five-worker `ThreadPoolExecutor`.
-- Product lookup cache is deleted after a successful update.
-- The current update path does not explicitly delete the old image cache entry; an image change may therefore continue returning cached content until that cache entry expires.
-- Cache contents are lost on restart and are not shared between processes.
+All constants live in barcode_server.py:
 
-## Security behavior
+```python
+DATA_DIR           = "barcode_data"
+INDEX_FILE         = "barcode_data/index.json"
+API_KEYS_FILE      = "barcode_data/api_keys.json"
+AUDIT_LOG_FILE     = "barcode_data/deletion_audit.log"
 
-The application currently implements:
+SHARD_LIMIT        = 10000               # rows per shard
+MAX_IMAGE_SIZE     = 5 * 1024 * 1024     # 5 MiB
+MAX_REDIRECTS      = 3                   # image redirect hops
+MAX_BATCH_SIZE     = 100                 # bulk operations
+MAX_DELETE_INDICES = 50                  # delete indices per call
+DEFAULT_PER_PAGE   = 50                  # pagination
+MAX_PER_PAGE       = 500                 # pagination cap
+IMAGE_MODE         = 'redirect'          # or 'proxy'
+```
 
-- HTTP/HTTPS-only image URLs.
-- Hostname resolution before image access.
-- Rejection of private, loopback, multicast, and link-local IPv4 addresses.
-- Explicit blocking of `169.254.*` link-local addresses.
-- `image/*` content-type validation.
-- A 5 MiB streaming download limit.
-- No redirect following during validation or download.
-- Prefixing values beginning with `+`, `-`, `=`, or `@` when adding CSV rows.
-- API-key checks for protected endpoints.
-- Request rate limiting.
+Environment variables:
 
-These are not a complete security boundary. The current implementation should also be deployed behind TLS, network egress controls, restricted file permissions, and proper secret management. The URL check skips IPv6 addresses rather than applying the same private-address checks. Also, the update path should be reviewed because its rewritten CSV values do not apply the same sanitization path used by `add()`.
+Variable Purpose
+BARCODE_API_KEY Initial key (first startup only)
+PORT Port for render.py
+RENDER_EXTERNAL_URL Self-ping target
 
-## Configuration
+---
 
-The main constants are in `barcode_server.py`:
+✦ Security Model
 
-| Setting | Default | Meaning |
-|---|---:|---|
-| `DATA_DIR` | `barcode_data` | Runtime data directory |
-| `INDEX_FILE` | `barcode_data/index.json` | JSON index path |
-| `API_KEYS_FILE` | `barcode_data/api_keys.json` | API-key file |
-| `SHARD_LIMIT` | `10000` | Data rows per shard |
-| `MAX_IMAGE_SIZE` | `5 * 1024 * 1024` | Maximum image size |
-| Lookup cache | `3600` seconds | Lookup cache lifetime |
-| Image cache | `86400` seconds | Image cache lifetime |
-| `BARCODE_API_KEY` | unset | Initial key source |
-| `PORT` | `5000` | Port used by `render.py` |
-| `RENDER_EXTERNAL_URL` | Code fallback URL | `render.py` ping target |
-| `PING_INTERVAL` | `720` seconds | `render.py` ping interval |
+What the server protects
 
-Most settings are source constants, not environment variables. Changing them requires editing the source and restarting the application.
+Layer Implementation
+Authentication X-API-Key header on writes
+Delete safety Confirm header + index-only + audit log + rate limit
+URL validation Public IPv4/IPv6 only; blocks private, loopback, reserved, multicast, link-local, unspecified
+Redirect safety Manual follow, max 3 hops, revalidate each hop
+Content type Must be image/*
+Size limit 5 MiB streaming cap
+CSV injection Prefixes + - = @ with ' on add and update
+Atomic writes JSON and CSV use temp file + os.replace
+Race safety Thread locks on DB, metrics, and API key cache
 
-## Metrics
+What it does NOT protect
 
-The metrics endpoint reports:
+· ✕ Not a WAF — deploy behind nginx or Cloudflare
+· ✕ Not encrypted — use HTTPS via reverse proxy
+· ✕ Keys are stored plaintext — protect the file
+· ✕ No user-level permissions — all-or-nothing per key
 
-- `total_requests`
-- `cache_hits`
-- `cache_misses`
-- `cache_hit_ratio`
-- `avg_response_time_ms`
-- `active_shard`
-- `total_entries`
+Recommended deployment
 
-The average response time is calculated from the most recent 1,000 recorded request times. Metrics are in-memory and process-local. They are not durable monitoring data.
+```
+Internet → Cloudflare/nginx (TLS) → Gunicorn (2 workers) → This app
+           ↑ rate limits, IP filtering, DDoS
+```
 
-## Errors and status codes
+---
 
-| Status | Meaning |
-|---:|---|
-| `200` | Request succeeded |
-| `400` | Invalid JSON, missing field, invalid index, duplicate, or invalid image |
-| `401` | Missing or invalid API key |
-| `403` | API key is disabled |
-| `404` | Barcode or image not found |
-| `429` | Rate limit exceeded |
-| `500` | Image download or unexpected server error |
+◎ Metrics & Health
 
-Typical error responses:
+/api/health
 
 ```json
-{"error":"Missing X-API-Key header."}
+{
+  "status": "ok",
+  "uptime": "2h 15m 30s",
+  "uptime_seconds": 8130,
+  "shards": 2,
+  "barcodes": 128,
+  "active_shard": "my_products_1.csv"
+}
 ```
+
+/api/stats
 
 ```json
-{"error":"Invalid API Key."}
+{
+  "products": {
+    "unique_barcodes": 128,
+    "total_products": 356,
+    "with_image": 312,
+    "without_image": 44,
+    "avg_per_barcode": 2.78
+  },
+  "storage": {
+    "total_size_bytes": 251187,
+    "index_size_bytes": 39116,
+    "total_shards": 2,
+    "shards": [
+      {"name": "my_products_0.csv", "size_bytes": 203468}
+    ]
+  },
+  "active_shard": {"name": "my_products_1.csv", "rows": 156, "limit": 10000},
+  "api_keys": {"total": 3, "enabled": 3, "disabled": 0}
+}
 ```
+
+Prometheus scraping
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'barcode-server'
+    metrics_path: '/api/metrics'
+    static_configs:
+      - targets: ['localhost:5000']
+```
+
+---
+
+▸ Deployment
+
+Docker
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY barcode_server.py .
+VOLUME ["/app/barcode_data"]
+EXPOSE 5000
+CMD ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:5000", "barcode_server:app"]
+```
+
+```bash
+docker build -t barcode-server .
+docker run -d -p 5000:5000 \
+  -v $(pwd)/barcode_data:/app/barcode_data \
+  -e BARCODE_API_KEY=my-secret \
+  barcode-server
+```
+
+Nginx reverse proxy
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 30s;
+    }
+}
+```
+
+Systemd service
+
+```ini
+[Unit]
+Description=Barcode Server
+After=network.target
+
+[Service]
+User=www-data
+WorkingDirectory=/opt/barcode-server
+Environment="BARCODE_API_KEY=secret"
+ExecStart=/opt/barcode-server/.venv/bin/gunicorn --workers 2 --bind 0.0.0.0:5000 barcode_server:app
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+▤ Backup & Recovery
+
+Backup everything together:
+
+```bash
+tar -czf barcode-backup-$(date +%Y%m%d).tar.gz barcode_data/
+```
+
+Files that matter:
+
+```
+barcode_data/
+├── index.json           ← CRITICAL (source of truth)
+├── api_keys.json        ← CRITICAL
+├── deletion_audit.log   ← IMPORTANT (audit trail)
+└── my_products_*.csv    ← REBUILDABLE from index.json
+```
+
+Recovery:
+
+1. Restore barcode_data/ from the backup
+2. Restart the server — the index is loaded into memory
+3. Shards are used only for export
+
+---
+
+✕ Error Codes
+
+Status Meaning Common Cause
+200 Success —
+400 Bad request Invalid JSON, missing field, invalid index, empty batch, invalid image, missing confirm header
+401 Unauthorized Missing or invalid API key
+403 Forbidden API key disabled
+404 Not found Barcode or image missing
+429 Rate limited Too many requests — wait
+500 Server error Image download failed, unexpected exception
+
+Error Response Format
 
 ```json
-{"error":"Barcode and Name are required fields."}
+{"error": "Human-readable message"}
 ```
 
-```json
-{"error":"No image associated with this product."}
+---
+
+▸ FAQ
+
+<details>
+<summary><b>Can I have multiple products under one barcode?</b></summary>
+
+Yes. Duplicate detection is on barcode + name. Different names under the same barcode are allowed.
+
+</details>
+
+<details>
+<summary><b>What happens when a shard reaches 10,000 rows?</b></summary>
+
+A new shard (my_products_1.csv, my_products_2.csv, ...) is created automatically. Old shards stay untouched.
+
+</details>
+
+<details>
+<summary><b>Why doesn't delete take a "delete all" option?</b></summary>
+
+By design. A single API key leak or a UI bug shouldn't be able to wipe the database. Delete requires explicit indices plus a confirmation header.
+
+</details>
+
+<details>
+<summary><b>Can I use this in a mobile app?</b></summary>
+
+Yes. Point your image widget directly at /api/lookup/<barcode>/image. The 302 redirect is followed automatically by browsers, Glide, SDWebImage, Coil, Flutter, and React Native.
+
+</details>
+
+<details>
+<summary><b>Why are lookup images redirects by default?</b></summary>
+
+Because 302 keeps the server's bandwidth and RAM near zero, which is critical for concurrency. If a source blocks hotlinks, add ?proxy=1 to stream it.
+
+</details>
+
+<details>
+<summary><b>How do I bulk import 1,000 products?</b></summary>
+
+Use /api/add-batch in batches of 100. Ten requests total.
+
+</details>
+
+<details>
+<summary><b>Is the API key secure?</b></summary>
+
+It's sent as a header (not URL), so it's not logged in access logs. But keys are stored plaintext in api_keys.json — protect that file.
+
+</details>
+
+<details>
+<summary><b>Can I run this with multiple workers?</b></summary>
+
+Yes, but each worker has separate caches, metrics, and rate limits. For proper multi-worker use, add Redis for cache and limits plus a real database.
+
+</details>
+
+<details>
+<summary><b>What happens if I delete all products under a barcode?</b></summary>
+
+The barcode key is removed from the index entirely. The next lookup returns 404.
+
+</details>
+
+<details>
+<summary><b>Where is the "delete all" endpoint?</b></summary>
+
+There isn't one — intentionally. See Security Model.
+
+</details>
+
+---
+
+▸ Troubleshooting
+
+<details>
+<summary><b>Image shows broken (403/404)</b></summary>
+
+The source blocks hotlinking. Use ?proxy=1:
+
+```
+/api/lookup/12345/image?proxy=1
 ```
 
-## Troubleshooting
+</details>
 
-### Port already in use
+<details>
+<summary><b>Delete returns 400</b></summary>
+
+Checklist:
+
+☐ X-API-Key header present and valid
+☐ X-Confirm-Delete: YES-DELETE header present
+☐ JSON body contains {"indices": [...]} with integers
+☐ Indices are within range for that barcode
+
+</details>
+
+<details>
+<summary><b>Port 5000 already in use</b></summary>
 
 ```bash
 gunicorn --bind 0.0.0.0:8000 barcode_server:app
 ```
 
-### Image validation fails
+</details>
 
-Confirm that the URL is reachable, uses HTTP/HTTPS, resolves to a public IPv4 address, returns `Content-Type: image/*`, and is no larger than 5 MiB.
+<details>
+<summary><b>Data looks corrupted</b></summary>
 
-### Product is not found
+1. Stop the server
+2. Back up barcode_data/
+3. Inspect index.json (source of truth)
+4. If shards are broken, restore them from the index by triggering an update or delete
 
-Confirm the barcode value after trimming whitespace. Use `python barcode_server.py --list` or inspect the index.
+Never run multiple writer processes against the same barcode_data/.
 
-### Data files look inconsistent
+</details>
 
-Stop the server, back up `barcode_data/`, and inspect the JSON index and shards together. Do not run multiple writer processes against the same local files.
+<details>
+<summary><b>Rate limit errors (429)</b></summary>
 
-### `429 Too Many Requests`
+Wait for the window to reset. In multi-worker setups, limits differ per worker.
 
-Wait for the applicable window to reset. Remember that rate-limit state is in memory and may differ between workers.
+</details>
 
-## Production notes
+<details>
+<summary><b>Search returns empty</b></summary>
 
-- Use HTTPS and a reverse proxy or managed ingress.
-- Rotate every key that has been exposed or committed.
-- Do not publish `api_keys.json` or production CSV data.
-- Back up the JSON index and every shard together.
-- The in-process lock protects threads in one process only; it does not coordinate Gunicorn workers or multiple instances.
-- JSON and CSV writes are not a single atomic transaction.
-- Updating a product rewrites all shards and can be expensive for large datasets.
-- For high concurrency or large data, use a database and shared cache/rate-limit backend.
-- Add automated tests before changing storage or security behavior.
-- Pin dependency versions and update them regularly after testing.
+Check that q is non-empty. It searches product name and barcode as case-insensitive substrings.
 
-## Contributing
+</details>
 
-1. Create a feature branch.
-2. Make a focused change.
-3. Update README examples when behavior changes.
-4. Test the affected CLI or API behavior locally.
-5. Open a pull request.
+---
 
-Never include real API keys, private data, or production exports in commits.
+✦ Contributing
 
-## License
+We welcome contributions.
 
-The project documentation identifies this project as `GPL-3.0-or-later`. A matching `LICENSE` file should be added to the repository so the legal terms are explicit. Confirm the license with the maintainer before redistribution.
+1. Fork the repo
+2. Create a branch — git checkout -b feature/amazing-thing
+3. Make focused changes — one feature per PR
+4. Update README if behavior changed
+5. Test locally — API and CLI
+6. Open a PR with a clear description
 
-## Support
+Before you push
 
-For bugs and feature requests, open a GitHub issue. Do not publish API keys, private product data, or sensitive security details in public issues.
+Never commit these files:
+
+```
+barcode_data/api_keys.json
+barcode_data/deletion_audit.log
+barcode_data/*.csv
+.env
+*.log
+```
+
+Suggested .gitignore
+
+```gitignore
+barcode_data/
+.venv/
+__pycache__/
+*.pyc
+.env
+*.log
+```
+
+---
+
+▤ License
+
+GPL-3.0-or-later
+
+This project should include a matching LICENSE file in the repo root so the legal terms are explicit. Confirm with the maintainer before redistribution.
+
+---
+
+▸ Support
+
+· Bug reports — Open an issue
+· Feature requests — Open an issue with a [Feature] prefix
+· Security issues — Do not open a public issue. Contact the maintainer privately.
+
+Never post API keys, private data, or production exports in public issues.
+
+---
+
+<div align="center">
+
+Built with care for the developer community
+
+Star this repo if it helped you.
+
+</div>
