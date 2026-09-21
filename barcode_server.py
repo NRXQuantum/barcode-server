@@ -12,6 +12,7 @@ import socket
 import ipaddress
 import logging
 import time
+from urllib.parse import urljoin, urlparse
 from flask import Flask, request, jsonify, send_file, redirect
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -22,15 +23,56 @@ from concurrent.futures import ThreadPoolExecutor
 DATA_DIR = "barcode_data"
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
 API_KEYS_FILE = os.path.join(DATA_DIR, "api_keys.json")
+AUDIT_LOG_FILE = os.path.join(DATA_DIR, "deletion_audit.log")
 SHARD_LIMIT = 10000
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_REDIRECTS = 3
+MAX_BATCH_SIZE = 100          # bulk add/lookup max items
+MAX_DELETE_INDICES = 50       # max indices per delete call
+DEFAULT_PER_PAGE = 50
+MAX_PER_PAGE = 500
+IMAGE_MODE = 'redirect'       # 'redirect' (default) or 'proxy'
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ==================== API KEYS MANAGER (unchanged) ====================
+# ==================== ATOMIC FILE WRITE HELPERS ====================
+def _atomic_write_json(path, data):
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def _count_csv_rows(path):
+    try:
+        with open(path, 'rb') as f:
+            count = 0
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                count += chunk.count(b'\n')
+        return max(0, count - 1)
+    except OSError:
+        return 0
+
+def _audit_log(action, key_name, barcode, indices, ip):
+    try:
+        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        line = f"{ts} | {action} | key={key_name} | barcode={barcode} | indices={indices} | ip={ip}\n"
+        with open(AUDIT_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(line)
+    except Exception as e:
+        logger.warning(f"Audit log write failed: {e}")
+
+# ==================== API KEYS MANAGER (cached) ====================
+_api_keys_cache = {'data': None, 'mtime': 0.0}
+_api_keys_lock = threading.Lock()
+
 def load_api_keys():
     if not os.path.exists(API_KEYS_FILE):
         default_key = os.environ.get('BARCODE_API_KEY', 'your-strong-api-key-here-12345')
@@ -41,16 +83,32 @@ def load_api_keys():
                 "limits": {"lookup": 300, "image": 10, "add": 10}
             }
         }
-        with open(API_KEYS_FILE, 'w') as f:
-            json.dump(default_data, f, indent=2)
+        _atomic_write_json(API_KEYS_FILE, default_data)
         logger.info(f"Default API key created: {default_key}")
+        with _api_keys_lock:
+            _api_keys_cache['data'] = default_data
+            _api_keys_cache['mtime'] = os.path.getmtime(API_KEYS_FILE)
         return default_data
-    with open(API_KEYS_FILE, 'r') as f:
-        return json.load(f)
+
+    mtime = os.path.getmtime(API_KEYS_FILE)
+    with _api_keys_lock:
+        if _api_keys_cache['data'] is not None and _api_keys_cache['mtime'] == mtime:
+            return _api_keys_cache['data']
+    with open(API_KEYS_FILE, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    with _api_keys_lock:
+        _api_keys_cache['data'] = data
+        _api_keys_cache['mtime'] = mtime
+    return data
 
 def save_api_keys(keys_data):
-    with open(API_KEYS_FILE, 'w') as f:
-        json.dump(keys_data, f, indent=2)
+    _atomic_write_json(API_KEYS_FILE, keys_data)
+    with _api_keys_lock:
+        _api_keys_cache['data'] = keys_data
+        try:
+            _api_keys_cache['mtime'] = os.path.getmtime(API_KEYS_FILE)
+        except OSError:
+            _api_keys_cache['mtime'] = 0.0
 
 def add_new_api_key(key, name, limits=None):
     keys = load_api_keys()
@@ -91,7 +149,9 @@ limiter = Limiter(
 cache = Cache(app, config={'CACHE_TYPE': 'SimpleCache', 'CACHE_DEFAULT_TIMEOUT': 3600})
 executor = ThreadPoolExecutor(max_workers=5)
 
-# ==================== MONITORING METRICS ====================
+_app_start_time = time.time()
+
+# ==================== MONITORING METRICS (thread-safe) ====================
 metrics = {
     'total_requests': 0,
     'cache_hits': 0,
@@ -99,20 +159,31 @@ metrics = {
     'avg_response_time': 0,
     'request_times': []
 }
+metrics_lock = threading.Lock()
 
 def update_metrics(start_time, cache_hit=False):
     elapsed = (time.time() - start_time) * 1000
-    metrics['total_requests'] += 1
-    if cache_hit:
-        metrics['cache_hits'] += 1
-    else:
-        metrics['cache_misses'] += 1
-    metrics['request_times'].append(elapsed)
-    if len(metrics['request_times']) > 1000:
-        metrics['request_times'].pop(0)
-    metrics['avg_response_time'] = sum(metrics['request_times']) / len(metrics['request_times'])
+    with metrics_lock:
+        metrics['total_requests'] += 1
+        if cache_hit:
+            metrics['cache_hits'] += 1
+        else:
+            metrics['cache_misses'] += 1
+        metrics['request_times'].append(elapsed)
+        if len(metrics['request_times']) > 1000:
+            metrics['request_times'].pop(0)
+        metrics['avg_response_time'] = sum(metrics['request_times']) / len(metrics['request_times'])
 
-# ==================== SECURITY HELPERS (unchanged) ====================
+def snapshot_metrics():
+    with metrics_lock:
+        return {
+            'total_requests': metrics['total_requests'],
+            'cache_hits': metrics['cache_hits'],
+            'cache_misses': metrics['cache_misses'],
+            'avg_response_time': metrics['avg_response_time'],
+        }
+
+# ==================== SECURITY HELPERS ====================
 def sanitize_csv_field(value):
     if isinstance(value, str) and value and value[0] in '+-=@':
         return "'" + value
@@ -120,7 +191,6 @@ def sanitize_csv_field(value):
 
 def is_safe_url(url):
     try:
-        from urllib.parse import urlparse
         parsed = urlparse(url)
         if parsed.scheme not in ('http', 'https'):
             return False, "Only HTTP/HTTPS protocols are allowed."
@@ -128,54 +198,89 @@ def is_safe_url(url):
         if not hostname:
             return False, "Invalid hostname."
         try:
-            ip_addresses = socket.getaddrinfo(hostname, None)
-        except:
+            addr_info = socket.getaddrinfo(hostname, None)
+        except socket.gaierror:
             return False, "Cannot resolve hostname."
-        for addr in ip_addresses:
+        for addr in addr_info:
             ip_str = addr[4][0]
-            if ':' in ip_str:
-                continue
             try:
                 ip_obj = ipaddress.ip_address(ip_str)
-                if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_multicast or ip_obj.is_link_local:
-                    return False, f"Private/Internal IP address not allowed: {ip_str}"
-                if ip_str.startswith('169.254.'):
-                    return False, f"Link-local IP blocked: {ip_str}"
-            except:
+            except ValueError:
                 return False, "Invalid IP address format."
+            if (ip_obj.is_private or ip_obj.is_loopback or
+                ip_obj.is_multicast or ip_obj.is_link_local or
+                ip_obj.is_reserved or ip_obj.is_unspecified):
+                return False, f"Private/Internal IP address not allowed: {ip_str}"
         return True, None
     except Exception as e:
         return False, f"Security check failed: {str(e)}"
 
+def _safe_fetch_head(url, timeout=5, max_redirects=MAX_REDIRECTS):
+    current = url
+    for _ in range(max_redirects + 1):
+        safe, msg = is_safe_url(current)
+        if not safe:
+            return None, msg
+        try:
+            resp = requests.head(current, timeout=timeout, allow_redirects=False)
+        except requests.exceptions.Timeout:
+            return None, "Request timeout."
+        except requests.exceptions.ConnectionError:
+            return None, "Connection failed."
+        except Exception as e:
+            return None, f"Request error: {e}"
+
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get('location')
+            if not location:
+                return None, "Redirect without Location header."
+            current = urljoin(current, location)
+            continue
+        return resp, None
+    return None, "Too many redirects."
+
 def validate_image_url(url, timeout=5):
     if not url:
         return False, "URL is empty."
-    safe, msg = is_safe_url(url)
-    if not safe:
-        return False, f"Security validation failed: {msg}"
-    try:
-        resp = requests.head(url, timeout=timeout, allow_redirects=False)
-        if resp.status_code not in (200, 301, 302):
-            return False, f"HTTP error: {resp.status_code}"
-        content_type = resp.headers.get('content-type', '')
-        if not content_type.startswith('image/'):
-            return False, f"Invalid content type: {content_type}. Only images are allowed."
-        content_length = resp.headers.get('content-length')
-        if content_length and int(content_length) > MAX_IMAGE_SIZE:
-            return False, f"Image exceeds maximum size limit ({MAX_IMAGE_SIZE} bytes)."
-        return True, None
-    except requests.exceptions.Timeout:
-        return False, "Request timeout."
-    except requests.exceptions.ConnectionError:
-        return False, "Connection failed."
-    except Exception as e:
-        return False, f"Validation error: {str(e)}"
+    resp, err = _safe_fetch_head(url, timeout=timeout)
+    if err:
+        return False, err
+    if resp.status_code != 200:
+        return False, f"HTTP error: {resp.status_code}"
+    content_type = resp.headers.get('content-type', '')
+    if not content_type.startswith('image/'):
+        return False, f"Invalid content type: {content_type}. Only images are allowed."
+    content_length = resp.headers.get('content-length')
+    if content_length:
+        try:
+            if int(content_length) > MAX_IMAGE_SIZE:
+                return False, f"Image exceeds maximum size limit ({MAX_IMAGE_SIZE} bytes)."
+        except ValueError:
+            pass
+    return True, None
 
-def download_safe_image(url):
-    safe, msg = is_safe_url(url)
-    if not safe:
-        raise ValueError(f"URL blocked: {msg}")
-    resp = requests.get(url, timeout=10, stream=True, allow_redirects=False)
+def download_safe_image(url, timeout=10, max_redirects=MAX_REDIRECTS):
+    current = url
+    resp = None
+    for _ in range(max_redirects + 1):
+        safe, msg = is_safe_url(current)
+        if not safe:
+            raise ValueError(f"URL blocked: {msg}")
+        try:
+            resp = requests.get(current, timeout=timeout, stream=True, allow_redirects=False)
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Request failed: {e}")
+
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get('location')
+            if not location:
+                raise Exception("Redirect without Location header.")
+            current = urljoin(current, location)
+            continue
+        break
+    else:
+        raise Exception("Too many redirects.")
+
     if resp.status_code != 200:
         raise Exception(f"HTTP error {resp.status_code}")
     content_type = resp.headers.get('content-type', '')
@@ -190,17 +295,16 @@ def download_safe_image(url):
             raise Exception("Image download exceeded size limit.")
     return content, content_type
 
-# ==================== DATABASE CLASS (MULTI-PRODUCT + UPDATE) ====================
+# ==================== DATABASE CLASS ====================
 class BarcodeDB:
     def __init__(self):
-        self.index = {}  # barcode -> list of product dicts
+        self.index = {}
         self.active_shard = None
         self.active_count = 0
         self.lock = threading.Lock()
         self._initialize()
 
     def _initialize(self):
-        # ----- Migrate legacy single CSV if exists -----
         legacy_file = 'my_products.csv'
         if os.path.exists(legacy_file) and not os.path.exists(INDEX_FILE):
             logger.info("Migrating from legacy my_products.csv ...")
@@ -221,13 +325,11 @@ class BarcodeDB:
                             'image': row['image_url'],
                             'shard': os.path.basename(shard_name)
                         })
-                with open(INDEX_FILE, 'w') as f:
-                    json.dump(self.index, f, indent=2)
+                _atomic_write_json(INDEX_FILE, self.index)
                 logger.info(f"Migration complete. {len(rows)} entries moved.")
 
-        # ----- Load existing index (may be old dict format) -----
         if os.path.exists(INDEX_FILE):
-            with open(INDEX_FILE, 'r') as f:
+            with open(INDEX_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             if data and isinstance(next(iter(data.values())), dict):
                 logger.info("Converting old index format to multi-product format...")
@@ -235,21 +337,18 @@ class BarcodeDB:
                 for bc, prod in data.items():
                     new_index[bc] = [prod]
                 self.index = new_index
-                with open(INDEX_FILE, 'w') as f:
-                    json.dump(self.index, f, indent=2)
+                _atomic_write_json(INDEX_FILE, self.index)
                 logger.info("Conversion complete.")
             else:
                 self.index = data
 
-        # ----- Manage shard files -----
         shard_files = glob.glob(os.path.join(DATA_DIR, "my_products_*.csv"))
         if not shard_files:
             self._create_new_shard()
         else:
             shard_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
             self.active_shard = shard_files[-1]
-            with open(self.active_shard, 'r', encoding='utf-8') as f:
-                self.active_count = sum(1 for _ in f) - 1
+            self.active_count = _count_csv_rows(self.active_shard)
             if self.active_count >= SHARD_LIMIT:
                 self._create_new_shard()
 
@@ -267,8 +366,12 @@ class BarcodeDB:
     def _extract_url(self, text):
         if not text:
             return ''
-        urls = re.findall(r'https?://[^\s"\']+', text)
-        return urls[0] if urls else text.strip()
+        match = re.search(r'https?://[^\s"\'<>]+', text)
+        if not match:
+            return text.strip()
+        url = match.group(0)
+        url = re.sub(r'[.,;:!?)\]\}]+$', '', url)
+        return url
 
     def _cache_image_async(self, img_url, barcode):
         try:
@@ -278,7 +381,7 @@ class BarcodeDB:
         except Exception as e:
             logger.warning(f"Background caching failed for {barcode}: {e}")
 
-    # ---------- ADD: allows multiple products per barcode, prevents exact duplicate (same barcode+name) ----------
+    # ---------- ADD ----------
     def add(self, barcode, name, image, validate=True):
         clean_img = self._extract_url(image)
         safe_barcode = sanitize_csv_field(barcode)
@@ -291,7 +394,6 @@ class BarcodeDB:
                 return False, f"Image validation failed: {err_msg}"
 
         with self.lock:
-            # Check for exact duplicate (same barcode and same name)
             if raw_barcode in self.index:
                 for prod in self.index[raw_barcode]:
                     if prod['name'] == safe_name:
@@ -314,8 +416,7 @@ class BarcodeDB:
                 writer.writerow([safe_barcode, safe_name, clean_img])
             self.active_count += 1
 
-            with open(INDEX_FILE, 'w') as f:
-                json.dump(self.index, f, indent=2)
+            _atomic_write_json(INDEX_FILE, self.index)
 
             if clean_img:
                 executor.submit(self._cache_image_async, clean_img, raw_barcode)
@@ -323,12 +424,8 @@ class BarcodeDB:
             logger.info(f"Product added: {raw_barcode} -> {safe_name}")
             return True, "OK"
 
-    # ---------- UPDATE: edit product name and/or image ----------
+    # ---------- UPDATE ----------
     def update(self, barcode, product_index, new_name=None, new_image=None, validate=True):
-        """
-        Update a specific product (by index in the list) for a barcode.
-        Returns (success, message, updated_product_dict)
-        """
         raw_barcode = barcode.strip()
         with self.lock:
             if raw_barcode not in self.index:
@@ -339,8 +436,12 @@ class BarcodeDB:
                 return False, f"Invalid product index. Must be between 0 and {len(products)-1}.", None
 
             prod = products[product_index]
-            # Determine new values (keep old if None)
-            final_name = new_name.strip() if new_name is not None and new_name.strip() != '' else prod['name']
+
+            if new_name is not None and new_name.strip() != '':
+                final_name = sanitize_csv_field(new_name.strip())
+            else:
+                final_name = prod['name']
+
             if new_image is not None and new_image.strip() != '':
                 clean_img = self._extract_url(new_image)
                 if validate and clean_img:
@@ -351,82 +452,119 @@ class BarcodeDB:
             else:
                 final_image = prod['image']
 
-            # Check if we're actually changing anything
             if final_name == prod['name'] and final_image == prod['image']:
                 return False, "No changes detected.", None
 
-            # Update the product in index
             prod['name'] = final_name
             prod['image'] = final_image
 
-            # Save index
-            with open(INDEX_FILE, 'w') as f:
-                json.dump(self.index, f, indent=2)
-
-            # Rewrite all CSV shards from index
+            _atomic_write_json(INDEX_FILE, self.index)
             self._rewrite_all_shards()
 
-            # Clear cache for this barcode so lookup gets fresh data
             cache.delete(raw_barcode)
+            cache.delete(f"img_{raw_barcode}")
 
             logger.info(f"Product updated: {raw_barcode} index {product_index} -> {final_name}")
             return True, "Update successful.", prod
 
+    # ---------- DELETE (index-based, one or many) ----------
+    def delete(self, barcode, indices):
+        """
+        Delete one or more products from a barcode by index.
+        Cannot delete the barcode itself, only products under it.
+        Returns (success, message, details_list).
+        """
+        raw_barcode = barcode.strip()
+        with self.lock:
+            if raw_barcode not in self.index:
+                return False, f"Barcode '{raw_barcode}' not found.", []
+
+            products = self.index[raw_barcode]
+
+            # Validate all indices are integers and in-range
+            invalid = []
+            for i in indices:
+                if not isinstance(i, int) or i < 0 or i >= len(products):
+                    invalid.append(i)
+            if invalid:
+                return False, f"Invalid index/indices: {invalid}. Valid range: 0..{len(products)-1}", []
+
+            # Dedupe and sort descending so pops don't shift each other
+            unique_desc = sorted(set(indices), reverse=True)
+
+            details = []
+            for i in unique_desc:
+                removed = products.pop(i)
+                details.append({
+                    "index": i,
+                    "status": "deleted",
+                    "name": removed.get('name', '')
+                })
+
+            # If this barcode now has no products, remove the key entirely
+            if len(products) == 0:
+                del self.index[raw_barcode]
+
+            _atomic_write_json(INDEX_FILE, self.index)
+            self._rewrite_all_shards()
+
+            cache.delete(raw_barcode)
+            cache.delete(f"img_{raw_barcode}")
+
+            # Sort details ascending for readable output
+            details.sort(key=lambda d: d['index'])
+            logger.info(f"Deleted {len(details)} product(s) from barcode {raw_barcode}")
+            return True, "OK", details
+
     def _rewrite_all_shards(self):
-        """
-        Rewrite all CSV shards from the current index.
-        This ensures CSV files are always in sync with index.
-        """
-        # Delete existing shard files
-        shard_files = glob.glob(os.path.join(DATA_DIR, "my_products_*.csv"))
-        for f in shard_files:
-            try:
-                os.remove(f)
-            except:
-                pass
+        all_products = self.get_all()
 
-        # Re-create shards from index
-        all_products = self.get_all()  # flattened list of dicts with barcode, product_name, image_url
-        if not all_products:
-            # If no products, create an empty shard
-            self._create_new_shard()
-            return
-
-        # Write products in batches of SHARD_LIMIT
+        shard_contents = []
         batch = []
-        shard_idx = 0
         for prod in all_products:
             batch.append([prod['barcode'], prod['product_name'], prod['image_url']])
             if len(batch) >= SHARD_LIMIT:
-                self._write_shard_from_list(shard_idx, batch)
-                shard_idx += 1
+                shard_contents.append(batch)
                 batch = []
         if batch:
-            self._write_shard_from_list(shard_idx, batch)
+            shard_contents.append(batch)
+        if not shard_contents:
+            shard_contents.append([])
 
-        # Update active_shard and active_count
-        shard_files = glob.glob(os.path.join(DATA_DIR, "my_products_*.csv"))
-        if shard_files:
-            shard_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
-            self.active_shard = shard_files[-1]
-            with open(self.active_shard, 'r', encoding='utf-8') as f:
-                self.active_count = sum(1 for _ in f) - 1
+        for idx, rows in enumerate(shard_contents):
+            self._write_shard_from_list(idx, rows)
+
+        existing = sorted(
+            glob.glob(os.path.join(DATA_DIR, "my_products_*.csv")),
+            key=lambda x: int(x.split('_')[-1].split('.')[0])
+        )
+        for extra in existing[len(shard_contents):]:
+            try:
+                os.remove(extra)
+            except OSError as e:
+                logger.warning(f"Failed to remove extra shard {extra}: {e}")
+
+        if shard_contents:
+            self.active_shard = os.path.join(DATA_DIR, f"my_products_{len(shard_contents)-1}.csv")
+            self.active_count = len(shard_contents[-1])
         else:
             self._create_new_shard()
 
     def _write_shard_from_list(self, idx, rows):
         shard_path = os.path.join(DATA_DIR, f"my_products_{idx}.csv")
-        with open(shard_path, 'w', newline='', encoding='utf-8') as f:
+        tmp = shard_path + '.tmp'
+        with open(tmp, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(['barcode', 'product_name', 'image_url'])
             writer.writerows(rows)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, shard_path)
 
-    # ---------- LOOKUP: returns list of products for a barcode ----------
     def lookup(self, barcode):
         raw = barcode.strip()
         return self.index.get(raw, [])
 
-    # ---------- GET ALL: flatten all products into list of dicts ----------
     def get_all(self):
         all_products = []
         for bc, products in self.index.items():
@@ -478,26 +616,60 @@ def get_image_limit():
         return f"{limits.get('image', 5)} per second"
     return "1 per 3 seconds"
 
+def get_add_limit():
+    key = request.headers.get('X-API-Key')
+    if key:
+        limits = get_key_limits(key)
+        return f"{limits.get('add', 5)} per second"
+    return "5 per second"
+
+# ==================== PAGINATION HELPER ====================
+def _paginate(items, page, per_page):
+    total = len(items)
+    total_pages = (total + per_page - 1) // per_page if per_page else 1
+    start = (page - 1) * per_page
+    end = start + per_page
+    return items[start:end], total, total_pages
+
+def _parse_pagination():
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+    except (ValueError, TypeError):
+        page = 1
+    try:
+        per_page = int(request.args.get('per_page', DEFAULT_PER_PAGE))
+        per_page = min(MAX_PER_PAGE, max(1, per_page))
+    except (ValueError, TypeError):
+        per_page = DEFAULT_PER_PAGE
+    return page, per_page
+
 # ==================== FLASK ROUTES ====================
 @app.route('/api/')
 @limiter.limit("30 per second")
 def api_home():
     return jsonify({
-        "message": "Multi-Product Barcode API (supports edit/update)",
-        "auth": "Provide X-API-Key header for POST/Export endpoints.",
+        "message": "Multi-Product Barcode API (supports edit/update/delete/batch/search)",
+        "auth": "Provide X-API-Key header for protected endpoints.",
         "endpoints": {
-            "GET /api/lookup/<barcode>": "Public (returns list of products)",
-            "GET /api/lookup/<barcode>/image": "Public (downloads first product's image)",
-            "POST /api/add": "🔒 Requires Key (async background cache)",
-            "PUT /api/update/<barcode>": "🔒 Requires Key (update product)",
-            "GET /api/all": "Public (rate limited)",
+            "GET /api/lookup/<barcode>": "Public (list of products)",
+            "GET /api/lookup/<barcode>/image": "Public (302 redirect; ?proxy=1 to stream)",
+            "POST /api/lookup-batch": "Public (bulk lookup)",
+            "POST /api/add": "🔒 Requires Key",
+            "POST /api/add-batch": "🔒 Requires Key (bulk add)",
+            "PUT /api/update/<barcode>": "🔒 Requires Key",
+            "DELETE /api/delete/<barcode>": "🔒 Requires Key + X-Confirm-Delete: YES-DELETE",
+            "GET /api/all": "Public (page=1&per_page=50 for paginated)",
+            "GET /api/search?q=<text>": "Public (search name or barcode)",
             "GET /api/export": "🔒 Requires Key (ZIP download)",
-            "GET /api/metrics": "Public (server performance)"
+            "GET /api/metrics": "Public (server performance)",
+            "GET /api/stats": "Public (JSON stats)",
+            "GET /api/health": "Public (health check)"
         }
     })
 
+# ---------- ADD (single) ----------
 @app.route('/api/add', methods=['POST'])
-@limiter.limit("5 per second", key_func=get_custom_key)
+@limiter.limit(get_add_limit, key_func=get_custom_key)
 @require_api_key
 def api_add_product():
     start = time.time()
@@ -519,8 +691,48 @@ def api_add_product():
         "shard": os.path.basename(db.active_shard)
     })
 
+# ---------- ADD (batch) ----------
+@app.route('/api/add-batch', methods=['POST'])
+@limiter.limit(get_add_limit, key_func=get_custom_key)
+@require_api_key
+def api_add_batch():
+    start = time.time()
+    data = request.get_json()
+    if not isinstance(data, list):
+        return jsonify({"error": "Body must be a JSON array."}), 400
+    if len(data) == 0:
+        return jsonify({"error": "Empty array."}), 400
+    if len(data) > MAX_BATCH_SIZE:
+        return jsonify({"error": f"Maximum {MAX_BATCH_SIZE} items per batch."}), 400
+
+    added = 0
+    failed = 0
+    results = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            results.append({"index": i, "status": "error", "reason": "Not an object"})
+            failed += 1
+            continue
+        barcode = item.get('barcode')
+        name = item.get('name')
+        if not barcode or not name:
+            results.append({"index": i, "status": "error", "reason": "Missing barcode or name"})
+            failed += 1
+            continue
+        ok, msg = db.add(barcode, name, item.get('image', ''), validate=True)
+        if ok:
+            results.append({"index": i, "status": "added", "barcode": barcode})
+            added += 1
+        else:
+            results.append({"index": i, "status": "error", "reason": msg})
+            failed += 1
+
+    update_metrics(start)
+    return jsonify({"added": added, "failed": failed, "results": results})
+
+# ---------- UPDATE ----------
 @app.route('/api/update/<barcode>', methods=['PUT'])
-@limiter.limit("5 per second", key_func=get_custom_key)
+@limiter.limit(get_add_limit, key_func=get_custom_key)
 @require_api_key
 def api_update_product(barcode):
     start = time.time()
@@ -528,12 +740,12 @@ def api_update_product(barcode):
     if not data:
         return jsonify({"error": "Send JSON payload."}), 400
 
-    product_index = data.get('index')  # which product in the list (0-based)
+    product_index = data.get('index')
     if product_index is None:
         return jsonify({"error": "Product index is required."}), 400
     try:
         idx = int(product_index)
-    except:
+    except (ValueError, TypeError):
         return jsonify({"error": "Index must be an integer."}), 400
 
     new_name = data.get('name')
@@ -550,6 +762,53 @@ def api_update_product(barcode):
         "updated_product": updated
     })
 
+# ---------- DELETE (one or many indices, API key + confirm header) ----------
+@app.route('/api/delete/<barcode>', methods=['DELETE'])
+@limiter.limit("5 per minute", key_func=get_custom_key)
+@require_api_key
+def api_delete_product(barcode):
+    start = time.time()
+
+    # Extra safety: confirmation header mandatory
+    if request.headers.get('X-Confirm-Delete') != 'YES-DELETE':
+        return jsonify({
+            "error": "Missing or invalid X-Confirm-Delete header. "
+                     "Set to 'YES-DELETE' to confirm deletion."
+        }), 400
+
+    data = request.get_json(silent=True)
+    if not data or 'indices' not in data:
+        return jsonify({"error": "Body must contain 'indices' array."}), 400
+
+    indices = data.get('indices')
+    if not isinstance(indices, list) or len(indices) == 0:
+        return jsonify({"error": "'indices' must be a non-empty list."}), 400
+    if len(indices) > MAX_DELETE_INDICES:
+        return jsonify({"error": f"Maximum {MAX_DELETE_INDICES} indices per request."}), 400
+
+    success, msg, details = db.delete(barcode, indices)
+
+    # Audit log regardless of success
+    _audit_log(
+        action="delete" if success else "delete_failed",
+        key_name=getattr(request, 'api_key_name', 'Unknown'),
+        barcode=barcode,
+        indices=indices,
+        ip=request.remote_addr
+    )
+
+    update_metrics(start)
+
+    if not success:
+        return jsonify({"error": msg}), 400
+
+    return jsonify({
+        "status": "ok",
+        "deleted": len(details),
+        "details": details
+    })
+
+# ---------- LOOKUP (single) ----------
 @app.route('/api/lookup/<barcode>')
 @limiter.limit(get_lookup_limit, key_func=get_custom_key)
 def api_lookup_product(barcode):
@@ -557,22 +816,40 @@ def api_lookup_product(barcode):
     cached = cache.get(barcode)
     if cached is not None:
         update_metrics(start, cache_hit=True)
-        return jsonify({
-            "barcode": barcode,
-            "products": cached
-        })
+        return jsonify({"barcode": barcode, "products": cached})
 
     products = db.lookup(barcode)
     if products:
         cache.set(barcode, products, timeout=3600)
         update_metrics(start, cache_hit=False)
-        return jsonify({
-            "barcode": barcode,
-            "products": products
-        })
+        return jsonify({"barcode": barcode, "products": products})
     update_metrics(start)
     return jsonify({"error": "Barcode not found."}), 404
 
+# ---------- LOOKUP (batch) ----------
+@app.route('/api/lookup-batch', methods=['POST'])
+@limiter.limit(get_lookup_limit, key_func=get_custom_key)
+def api_lookup_batch():
+    start = time.time()
+    data = request.get_json(silent=True)
+    if not isinstance(data, list):
+        return jsonify({"error": "Body must be a JSON array of barcodes."}), 400
+    if len(data) == 0:
+        return jsonify({"error": "Empty array."}), 400
+    if len(data) > MAX_BATCH_SIZE:
+        return jsonify({"error": f"Maximum {MAX_BATCH_SIZE} barcodes per batch."}), 400
+
+    results = {}
+    for bc in data:
+        if not isinstance(bc, str):
+            continue
+        products = db.lookup(bc)
+        results[bc] = products if products else None
+
+    update_metrics(start)
+    return jsonify(results)
+
+# ---------- IMAGE (hybrid: redirect default, ?proxy=1 stream) ----------
 @app.route('/api/lookup/<barcode>/image')
 @limiter.limit(get_image_limit, key_func=get_custom_key)
 def api_download_image(barcode):
@@ -585,39 +862,99 @@ def api_download_image(barcode):
     if not img_url:
         return jsonify({"error": "No image associated with this product."}), 404
 
-    cached_img = cache.get(f"img_{barcode}")
-    if cached_img:
-        content, content_type = cached_img
-        update_metrics(start, cache_hit=True)
-        return send_file(
-            io.BytesIO(content),
-            mimetype=content_type,
-            as_attachment=True,
-            download_name=f"{barcode}.jpg"
-        )
+    # Proxy fallback mode (heavy but always works)
+    use_proxy = (request.args.get('proxy') == '1') or (IMAGE_MODE == 'proxy')
+    if use_proxy:
+        cached_img = cache.get(f"img_{barcode}")
+        if cached_img:
+            content, content_type = cached_img
+            update_metrics(start, cache_hit=True)
+            return send_file(
+                io.BytesIO(content),
+                mimetype=content_type,
+                as_attachment=False,
+                download_name=f"{barcode}.jpg"
+            )
+        try:
+            content, content_type = download_safe_image(img_url)
+            cache.set(f"img_{barcode}", (content, content_type), timeout=86400)
+            update_metrics(start, cache_hit=False)
+            return send_file(
+                io.BytesIO(content),
+                mimetype=content_type,
+                as_attachment=False,
+                download_name=f"{barcode}.jpg"
+            )
+        except Exception as e:
+            logger.error(f"Image proxy failed: {e}")
+            return jsonify({"error": f"Failed to download image: {str(e)}"}), 500
 
-    try:
-        content, content_type = download_safe_image(img_url)
-        cache.set(f"img_{barcode}", (content, content_type), timeout=86400)
-        update_metrics(start, cache_hit=False)
-        return send_file(
-            io.BytesIO(content),
-            mimetype=content_type,
-            as_attachment=True,
-            download_name=f"{barcode}.jpg"
-        )
-    except Exception as e:
-        logger.error(f"Image download failed: {e}")
-        return jsonify({"error": f"Failed to download image: {str(e)}"}), 500
+    # Default: 302 redirect (lightweight, no server load)
+    update_metrics(start)
+    return redirect(img_url, code=302)
 
+# ---------- ALL (backward compatible + pagination) ----------
 @app.route('/api/all')
 @limiter.limit("30 per second")
 def api_all_products():
     start = time.time()
-    data = db.get_all()
-    update_metrics(start)
-    return jsonify(data)
 
+    # Backward compat: no page/per_page → old flat array
+    if 'page' not in request.args and 'per_page' not in request.args:
+        data = db.get_all()
+        update_metrics(start)
+        return jsonify(data)
+
+    page, per_page = _parse_pagination()
+    all_products = db.get_all()
+    items, total, total_pages = _paginate(all_products, page, per_page)
+    update_metrics(start)
+    return jsonify({
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "total_pages": total_pages,
+        "items": items
+    })
+
+# ---------- SEARCH ----------
+@app.route('/api/search')
+@limiter.limit("30 per second")
+def api_search():
+    start = time.time()
+
+    q = request.args.get('q', '').strip()
+    if not q:
+        return jsonify({"error": "Query parameter 'q' is required."}), 400
+
+    q_lower = q.lower()
+    page, per_page = _parse_pagination()
+
+    matches = []
+    for bc, plist in db.index.items():
+        bc_match = q_lower in bc.lower()
+        for prod in plist:
+            name_match = q_lower in prod['name'].lower()
+            if bc_match or name_match:
+                matches.append({
+                    'barcode': bc,
+                    'product_name': prod['name'],
+                    'image_url': prod['image'],
+                    'shard': prod['shard']
+                })
+
+    items, total, total_pages = _paginate(matches, page, per_page)
+    update_metrics(start)
+    return jsonify({
+        "query": q,
+        "page": page,
+        "per_page": per_page,
+        "total_matches": total,
+        "total_pages": total_pages,
+        "items": items
+    })
+
+# ---------- EXPORT ----------
 @app.route('/api/export')
 @limiter.limit("2 per minute", key_func=get_custom_key)
 @require_api_key
@@ -642,20 +979,104 @@ def api_export_zip():
         download_name='all_shards.zip'
     )
 
+# ---------- METRICS ----------
 @app.route('/api/metrics')
 @limiter.limit("10 per minute")
 def get_metrics():
+    snap = snapshot_metrics()
     return jsonify({
-        "total_requests": metrics['total_requests'],
-        "cache_hits": metrics['cache_hits'],
-        "cache_misses": metrics['cache_misses'],
-        "cache_hit_ratio": round(metrics['cache_hits'] / max(1, metrics['total_requests']) * 100, 2),
-        "avg_response_time_ms": round(metrics['avg_response_time'], 2),
+        "total_requests": snap['total_requests'],
+        "cache_hits": snap['cache_hits'],
+        "cache_misses": snap['cache_misses'],
+        "cache_hit_ratio": round(snap['cache_hits'] / max(1, snap['total_requests']) * 100, 2),
+        "avg_response_time_ms": round(snap['avg_response_time'], 2),
         "active_shard": os.path.basename(db.active_shard),
         "total_entries": len(db.index)
     })
 
-# ==================== REDIRECTS ====================
+# ---------- STATS (JSON) ----------
+@app.route('/api/stats')
+@limiter.limit("30 per second")
+def api_stats():
+    def _shard_num(p):
+        m = re.search(r'_(\d+)\.csv$', p)
+        return int(m.group(1)) if m else 0
+
+    shard_files = sorted(
+        glob.glob(os.path.join(DATA_DIR, "my_products_*.csv")),
+        key=_shard_num
+    )
+
+    total_products = sum(len(p) for p in db.index.values())
+    products_with_image = sum(
+        1 for plist in db.index.values() for p in plist if p.get('image')
+    )
+
+    def _size(p):
+        try:
+            return os.path.getsize(p)
+        except OSError:
+            return 0
+
+    index_size = _size(INDEX_FILE)
+    keys_size = _size(API_KEYS_FILE)
+    shard_sizes = [(os.path.basename(sf), _size(sf)) for sf in shard_files]
+    total_size = index_size + keys_size + sum(s for _, s in shard_sizes)
+
+    try:
+        kd = load_api_keys()
+        total_keys = len(kd)
+        enabled_keys = sum(1 for v in kd.values() if v.get('enabled', True))
+    except Exception:
+        total_keys = enabled_keys = 0
+
+    return jsonify({
+        "products": {
+            "unique_barcodes": len(db.index),
+            "total_products": total_products,
+            "with_image": products_with_image,
+            "without_image": total_products - products_with_image,
+            "avg_per_barcode": round(total_products / max(1, len(db.index)), 2)
+        },
+        "storage": {
+            "data_dir": DATA_DIR,
+            "total_size_bytes": total_size,
+            "index_size_bytes": index_size,
+            "api_keys_size_bytes": keys_size,
+            "total_shards": len(shard_files),
+            "shards": [{"name": n, "size_bytes": s} for n, s in shard_sizes]
+        },
+        "active_shard": {
+            "name": os.path.basename(db.active_shard) if db.active_shard else None,
+            "rows": db.active_count,
+            "limit": SHARD_LIMIT
+        },
+        "api_keys": {
+            "total": total_keys,
+            "enabled": enabled_keys,
+            "disabled": total_keys - enabled_keys
+        }
+    })
+
+# ---------- HEALTH ----------
+@app.route('/api/health')
+@limiter.limit("60 per minute")
+def api_health():
+    uptime_seconds = int(time.time() - _app_start_time)
+    hours = uptime_seconds // 3600
+    minutes = (uptime_seconds % 3600) // 60
+    seconds = uptime_seconds % 60
+    shards = glob.glob(os.path.join(DATA_DIR, "my_products_*.csv"))
+    return jsonify({
+        "status": "ok",
+        "uptime": f"{hours}h {minutes}m {seconds}s",
+        "uptime_seconds": uptime_seconds,
+        "shards": len(shards),
+        "barcodes": len(db.index),
+        "active_shard": os.path.basename(db.active_shard) if db.active_shard else None
+    })
+
+# ==================== REDIRECTS (backward compat) ====================
 @app.route('/')
 def home(): return redirect('/api/')
 @app.route('/lookup/<barcode>')
@@ -722,7 +1143,6 @@ def interactive_edit():
 
 # ==================== CLI LIST ALL PRODUCTS ====================
 def list_all_products():
-    """Display all products in a formatted table in the terminal."""
     products = db.get_all()
     if not products:
         print("\n📭 No products found in the database.")
@@ -730,16 +1150,13 @@ def list_all_products():
 
     print(f"\n📋 Total Products: {len(products)}")
     print("=" * 150)
-    # Header
     print(f"{'Barcode':<20} | {'Product Name':<50} | {'Image URL'}")
     print("-" * 150)
 
-    # Data rows
     for p in products:
         barcode = p['barcode']
         name = p['product_name']
         image = p['image_url']
-        # Truncate long names for better display
         if len(name) > 48:
             name = name[:45] + "..."
         print(f"{barcode:<20} | {name:<50} | {image}")
@@ -768,7 +1185,6 @@ def interactive_add():
 def show_stats():
     """Display a clean, standard-level statistics dashboard."""
 
-    # ---------- ANSI ----------
     class C:
         R  = '\033[0m'
         B  = '\033[1m'
@@ -786,7 +1202,6 @@ def show_stats():
     def _vis(s):
         return len(ANSI_RE.sub('', s))
 
-    # ---------- shard scan ----------
     def _shard_num(path):
         m = re.search(r'_(\d+)\.csv$', path)
         return int(m.group(1)) if m else 0
@@ -796,7 +1211,6 @@ def show_stats():
         key=_shard_num
     )
 
-    # ---------- aggregate index ----------
     total_barcodes = len(db.index)
     total_products = 0
     products_with_image = 0
@@ -816,7 +1230,6 @@ def show_stats():
     avg_per_bc = (total_products / total_barcodes) if total_barcodes else 0
     max_bc = max(barcode_counts, key=lambda x: x[1]) if barcode_counts else None
 
-    # ---------- sizes ----------
     def _size(p):
         try:
             return os.path.getsize(p)
@@ -835,7 +1248,6 @@ def show_stats():
     shard_sizes = [(os.path.basename(sf), _size(sf)) for sf in shard_files]
     total_size = index_size + keys_size + sum(s for _, s in shard_sizes)
 
-    # ---------- api keys ----------
     try:
         kd = load_api_keys()
         total_keys    = len(kd)
@@ -844,7 +1256,6 @@ def show_stats():
     except Exception:
         total_keys = enabled_keys = disabled_keys = 0
 
-    # ---------- layout ----------
     WIDTH = 64
 
     def gradient():
@@ -877,7 +1288,6 @@ def show_stats():
         right = pad - left
         return f"{' ' * left}{text}{' ' * right}"
 
-    # ---------- print ----------
     print()
     print(gradient())
     print(center(
@@ -888,7 +1298,6 @@ def show_stats():
     print(gradient())
     print()
 
-    # PRODUCTS
     print(section('▣', 'PRODUCTS'))
     print(leader("Unique Barcodes",        f"{total_barcodes:,}"))
     print(leader("Total Products",         f"{total_products:,}"))
@@ -898,7 +1307,6 @@ def show_stats():
         print(leader("Largest Group", f"{max_bc[1]} products  (bc: {max_bc[0]})"))
     print()
 
-    # IMAGES
     print(section('◈', 'IMAGES'))
     if total_products:
         pct_with = (products_with_image / total_products) * 100
@@ -912,7 +1320,6 @@ def show_stats():
         print(leader("Without Image URL", "0  (0.0%)", C.GY))
     print()
 
-    # STORAGE
     print(section('▤', 'STORAGE'))
     print(leader("Data Directory", f"{DATA_DIR}/"))
     print(leader("Total Size",     _human(total_size)))
@@ -921,7 +1328,6 @@ def show_stats():
     print(leader("Total Shards",   f"{len(shard_files)}"))
     print()
 
-    # SHARD TABLE
     if shard_sizes:
         active_name = os.path.basename(db.active_shard) if db.active_shard else ""
         print(f"    {C.D}{'Shard File':<34}{'Size':>14}{C.R}")
@@ -933,7 +1339,6 @@ def show_stats():
             print(f"    {col}{name:<34}{_human(sz):>14}{C.R}{marker}")
         print()
 
-    # ACTIVE SHARD
     print(section('◎', 'ACTIVE SHARD'))
     if db.active_shard:
         print(leader("File", os.path.basename(db.active_shard)))
@@ -947,7 +1352,6 @@ def show_stats():
         print(leader("Remaining", f"{max(0, SHARD_LIMIT - db.active_count):,} rows", C.GY))
     print()
 
-    # API KEYS
     print(section('✦', 'API KEYS'))
     dcol = C.GR if disabled_keys == 0 else C.YE
     print(leader("Total Keys", f"{total_keys}"))
@@ -980,7 +1384,7 @@ def manage_keys():
                 for part in lim_str.split(','):
                     k, v = part.split(':')
                     limits[k] = int(v)
-            except:
+            except (ValueError, IndexError):
                 print("Warning: Invalid limits format. Ignoring.")
         success, msg = add_new_api_key(key, name, limits)
         print(f"{'✅' if success else '❌'} {msg}")
@@ -1016,7 +1420,7 @@ if __name__ == '__main__':
         else:
             print("Unknown command. Available: --add, --edit, --list, --stats, --add-key, --remove-key, --list-keys")
     else:
-        print(f"🚀 Multi-Product Barcode Server with Edit support running at: http://localhost:5000")
+        print(f"🚀 Multi-Product Barcode Server with Edit/Delete support running at: http://localhost:5000")
         print(f"🔑 Use 'X-API-Key' header for secure endpoints.")
         print(f"📊 Manage keys via CLI: --add-key, --remove-key, --list-keys")
         print(f"📝 Edit product: python barcode_server.py --edit")
