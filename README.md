@@ -41,7 +41,17 @@ A lightweight, self-hosted server that maps **barcodes → products → images**
 
 ## ▸ Quick Start
 
-**Get running in 60 seconds.**
+**Try the live demo:**
+
+```
+
+https://barcode-server-6vss.onrender.com
+
+```
+
+> The demo runs on a free Render instance. It may take 10–30 seconds to wake up after inactivity. Data on the demo is public and may be cleared periodically — do not store private information there.
+
+**Run your own in 60 seconds:**
 
 ```bash
 # 1. Clone & install
@@ -59,21 +69,33 @@ python barcode_server.py
 
 Server is live at http://localhost:5000
 
-Test it:
+Test it (local or live):
 
 ```bash
-# Add a product
-curl -X POST http://localhost:5000/api/add \
+# Using the live demo
+BASE="https://barcode-server-6vss.onrender.com"
+
+# Add a product (use your own key for the local server)
+curl -X POST $BASE/api/add \
   -H "X-API-Key: my-super-secret-key-change-me" \
   -H "Content-Type: application/json" \
   -d '{"barcode":"1234567890","name":"Coca Cola 500ml","image":"https://example.com/coke.jpg"}'
 
 # Look it up (no auth required)
-curl http://localhost:5000/api/lookup/1234567890
+curl $BASE/api/lookup/1234567890
 
-# See server stats
-python barcode_server.py --stats
+# Health check
+curl $BASE/api/health
 ```
+
+Common base URLs:
+
+Environment Base URL
+Local development http://localhost:5000
+Live demo (Render) https://barcode-server-6vss.onrender.com
+Your own deployment https://your-domain.com
+
+All examples below use http://localhost:5000. Replace with your own URL as needed.
 
 ---
 
@@ -95,6 +117,7 @@ Understanding the System
 · Storage Model
 · Image Delivery Modes
 · First Startup Behavior
+· Design Limits & Non-Goals
 
 Using the Server
 
@@ -143,8 +166,11 @@ Symbol Feature Description
 ▣ Bulk Operations Up to 100 items per batch
 ■ Safe Delete Index-based, audit-logged, confirm header
 ◎ Health & Stats JSON endpoints for monitoring
-✦ CSV Injection Guard Blocks + - = @ prefixes
+✦ CSV Injection Guard Blocks formula prefixes + control chars
 ✦ IPv4 + IPv6 Safe Rejects private/reserved addresses
+▤ Atomic Writes JSON & CSV use temp file + os.replace
+◎ Index Auto-Rebuild Rebuilds index.json from CSV shards if lost
+▤ Multi-Worker Aware Detects external index.json changes via mtime
 
 ---
 
@@ -166,10 +192,11 @@ Symbol Feature Description
 
 Data flow:
 
-1. Add — Validate image URL → Append to active CSV shard → Update JSON index → Cache in background
-2. Lookup — Check memory cache → Fall back to in-memory index → Return list of products
+1. Add — Validate image URL → Append to active CSV shard → Update JSON index (atomic) → Cache in background
+2. Lookup — Check cache → Fall back to in-memory index → Return list of products
 3. Image — Return 302 to original URL (fast) or stream via proxy (fallback)
 4. Delete — Verify API key + confirm header → Remove indices → Rewrite shards → Log to audit
+5. Recovery — If index.json is missing or corrupted, rebuild it from CSV shards automatically
 
 ---
 
@@ -194,7 +221,7 @@ Dependencies:
 Package Purpose
 flask Web framework
 flask-limiter Rate limiting
-flask-caching In-memory cache
+flask-caching File-based cache
 requests Image URL validation & download
 gunicorn Production WSGI server
 
@@ -215,7 +242,7 @@ Production (Gunicorn)
 gunicorn --workers 2 --bind 0.0.0.0:5000 barcode_server:app
 ```
 
-Warning — multi-worker setups: Each worker keeps its own cache, metrics, and rate limiter. They do not share state. For multi-worker setups use Redis for cache and rate limits, and a proper database.
+Warning — multi-worker setups: Each worker keeps its own cache, metrics, and rate limiter. They do not share state. The app automatically picks up external changes to index.json (via mtime check), so writes propagate across workers within a request cycle. For high-concurrency or multi-machine deployments, use Redis for cache and rate limits, and a proper database.
 
 Render.com (self-pinging)
 
@@ -223,7 +250,17 @@ Render.com (self-pinging)
 python render.py
 ```
 
-Pings /api/ every 12 minutes to keep the free instance alive.
+Pings /api/ every 12 minutes to keep the free instance alive. Uses RENDER_EXTERNAL_URL if set.
+
+Live demo
+
+A public instance is available at:
+
+```
+https://barcode-server-6vss.onrender.com
+```
+
+Free Render instances sleep after inactivity. First request may take 10–30 seconds to wake the server. Data is public and may be cleared at any time.
 
 ---
 
@@ -233,9 +270,10 @@ Directory Layout
 
 ```
 barcode_data/
-├── index.json              # barcode → [products]
+├── index.json              # barcode → [products]  (source of truth)
 ├── api_keys.json           # API key registry
 ├── deletion_audit.log      # every delete (success + failure)
+├── cache/                  # FileSystemCache files
 ├── my_products_0.csv       # shard (10k rows max)
 └── my_products_1.csv       # next shard (auto-created)
 ```
@@ -268,6 +306,7 @@ Max rows per shard 10,000
 Duplicate detection Same barcode + same name
 Index location barcode_data/index.json
 Audit log Append-only
+Auto-recovery Index rebuilt from shards if missing/corrupted
 
 ---
 
@@ -285,8 +324,9 @@ source.com → Client: [image bytes]
 ```
 
 · ▸ Near-zero server load
-· ▸ Unlimited concurrency
+· ▸ Effectively unlimited concurrency
 · ▸ Blocked by hotlink-protected sites
+· ▸ Depends on the external host being online
 
 ■ Mode B — Proxy (fallback)
 
@@ -297,14 +337,16 @@ source.com → API: [image bytes]
 API    → Client: [image bytes]
 ```
 
-· ▸ Works everywhere
+· ▸ Works everywhere, including hotlink-protected sites
 · ▸ Uses server bandwidth + RAM
+· ▸ Cached for 24 hours per barcode
 
 Use proxy when:
 
 · The source blocks hotlinking (Amazon, Flipkart)
 · The URL requires authentication headers
 · You need to hide the source URL
+· The external host is unreliable
 
 Switch mode:
 
@@ -315,6 +357,101 @@ curl "http://localhost:5000/api/lookup/12345/image?proxy=1"
 # Global default (edit source)
 IMAGE_MODE = 'proxy'
 ```
+
+---
+
+▤ First Startup Behavior
+
+When the application starts:
+
+1. barcode_data/ and barcode_data/cache/ are created if necessary.
+2. If api_keys.json does not exist, an initial key is created from BARCODE_API_KEY (or a fallback).
+3. index.json is loaded if present.
+4. If index.json is missing or corrupted, it is rebuilt automatically from CSV shards.
+5. A legacy root-level my_products.csv may be migrated to barcode_data/my_products_0.csv.
+6. An older single-product index format is converted to the current list-per-barcode format.
+7. If no shard exists, my_products_0.csv is created.
+
+---
+
+✦ Design Limits & Non-Goals
+
+This server is deliberately simple. It is not a replacement for a database.
+
+Scale
+
+What Comfortable limit
+Unique barcodes ~100,000 in memory
+Total rows CSV shards grow linearly; no secondary indexes
+Concurrent writes Single writer — one process should own the data dir
+Concurrent reads Effectively unlimited for lookup (in-memory)
+
+Beyond these, use PostgreSQL, SQLite with WAL, or a similar database.
+
+Multi-Worker Gotchas
+
+Running gunicorn --workers 4 creates four independent servers that happen to share a directory. Each has its own:
+
+· In-memory index (auto-reloaded when index.json mtime changes)
+· Lookup cache (FileSystemCache — shared on the same machine)
+· Rate-limit counters (in-memory, per worker)
+· Metrics (in-memory, per worker)
+
+Symptoms to expect:
+
+· Rate limits are multiplied by the number of workers
+· Metrics from /api/metrics show only the worker that answered
+· Writes are visible across workers after a short moment (mtime reload)
+
+Fix for true multi-worker: use Redis for cache and rate limits, and a real database.
+
+Public Lookup is Intentional
+
+GET /api/lookup/<bc> and /api/search have no authentication. This is by design — the API is intended for public product lookup, the same way a public catalog works.
+
+If your data is private, put the whole server behind:
+
+· A reverse proxy with basic auth, or
+· Cloudflare Access, or
+· VPN / IP allowlist
+
+There is no per-barcode access control built in.
+
+API Key Storage
+
+Keys are stored plaintext in barcode_data/api_keys.json.
+
+Minimum hardening:
+
+```bash
+chmod 600 barcode_data/api_keys.json
+chown www-data:www-data barcode_data/api_keys.json
+```
+
+For production, mount this file from a secret manager (Docker secret, Kubernetes Secret, Vault, etc.).
+
+Redirect Mode Depends on the External Host
+
+The default image mode returns a 302 to the source URL. This means:
+
+· If the source host is down → image is broken
+· If the source deletes the file → image is gone
+· If the source blocks hotlinks → image is blocked
+
+The server is not a CDN. It is a lookup service that points to images. Use ?proxy=1 if you need the server to own the image bytes, and accept the bandwidth cost.
+
+CSV Injection Guard — Scope
+
+The guard strips control characters and newlines, collapses spaces, and prefixes + - = @ with ' on add and update. This blocks the common spreadsheet-formula vector. It does not attempt to sanitize:
+
+· Unicode bidirectional or zero-width characters
+· Delimiter confusion beyond standard CSV escaping
+
+Treat CSV output as untrusted data, not as a hardened format.
+
+No "Delete All"
+
+There is intentionally no endpoint to delete the whole database. A single leaked API key or a UI bug should not be able to wipe everything. Deleting the entire barcode_data/ directory requires manual filesystem action.
 
 ---
 
@@ -373,7 +510,8 @@ python barcode_server.py --list-keys
 
 ▸ API Reference
 
-Base URL: http://localhost:5000/api
+Base URL (local): http://localhost:5000/api
+Base URL (live demo): https://barcode-server-6vss.onrender.com/api
 
 Endpoint Summary
 
@@ -597,7 +735,29 @@ curl http://localhost:5000/api/health
 
 ▸ GET /api/stats
 
-Public. JSON version of the --stats CLI dashboard. Full example in Metrics & Health.
+Public. JSON version of the --stats CLI dashboard.
+
+```json
+{
+  "products": {
+    "unique_barcodes": 128,
+    "total_products": 356,
+    "with_image": 312,
+    "without_image": 44,
+    "avg_per_barcode": 2.78
+  },
+  "storage": {
+    "total_size_bytes": 251187,
+    "index_size_bytes": 39116,
+    "total_shards": 2,
+    "shards": [
+      {"name": "my_products_0.csv", "size_bytes": 203468}
+    ]
+  },
+  "active_shard": {"name": "my_products_1.csv", "rows": 156, "limit": 10000},
+  "api_keys": {"total": 3, "enabled": 3, "disabled": 0}
+}
+```
 
 ▸ GET /api/metrics
 
@@ -635,7 +795,7 @@ Scenario: Your mobile app scans a barcode and shows product info and an image.
 ```
 1. App scans barcode      →  GET /api/lookup/6281006451865
 2. API returns product list
-3. App displays           →  <img src="https://api.example.com/api/lookup/6281006451865/image">
+3. App displays           →  <img src="https://your-api.example.com/api/lookup/6281006451865/image">
 4. Server returns 302     →  app auto-follows → image loads
 ```
 
@@ -673,6 +833,17 @@ Workflow 4 — Search & Paginate
 ```bash
 # Find all products with "para" in name or barcode
 curl "http://localhost:5000/api/search?q=para&page=1&per_page=50"
+```
+
+Workflow 5 — Disaster Recovery
+
+If index.json is deleted or corrupted, no action is needed — the server rebuilds it on next startup:
+
+```bash
+rm barcode_data/index.json
+python barcode_server.py --stats
+# → logs "index.json missing — rebuilding from CSV shards"
+# → all products recovered
 ```
 
 ---
@@ -742,6 +913,7 @@ DATA_DIR           = "barcode_data"
 INDEX_FILE         = "barcode_data/index.json"
 API_KEYS_FILE      = "barcode_data/api_keys.json"
 AUDIT_LOG_FILE     = "barcode_data/deletion_audit.log"
+CACHE_DIR          = "barcode_data/cache"
 
 SHARD_LIMIT        = 10000               # rows per shard
 MAX_IMAGE_SIZE     = 5 * 1024 * 1024     # 5 MiB
@@ -773,9 +945,10 @@ URL validation Public IPv4/IPv6 only; blocks private, loopback, reserved, multic
 Redirect safety Manual follow, max 3 hops, revalidate each hop
 Content type Must be image/*
 Size limit 5 MiB streaming cap
-CSV injection Prefixes + - = @ with ' on add and update
+CSV injection Strips control chars + prefixes + - = @ on add and update
 Atomic writes JSON and CSV use temp file + os.replace
 Race safety Thread locks on DB, metrics, and API key cache
+Auto-recovery Index rebuilt from shards if lost
 
 What it does NOT protect
 
@@ -821,11 +994,7 @@ Internet → Cloudflare/nginx (TLS) → Gunicorn (2 workers) → This app
   },
   "storage": {
     "total_size_bytes": 251187,
-    "index_size_bytes": 39116,
-    "total_shards": 2,
-    "shards": [
-      {"name": "my_products_0.csv", "size_bytes": 203468}
-    ]
+    "total_shards": 2
   },
   "active_shard": {"name": "my_products_1.csv", "rows": 156, "limit": 10000},
   "api_keys": {"total": 3, "enabled": 3, "disabled": 0}
@@ -842,6 +1011,8 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:5000']
 ```
+
+In multi-worker setups, Prometheus should scrape each worker separately or a Redis-backed exporter should be used to aggregate.
 
 ---
 
@@ -902,6 +1073,10 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
+Render.com
+
+The repo includes render.py which starts the Flask server and a background thread that pings /api/ every 12 minutes. Set RENDER_EXTERNAL_URL in the Render dashboard to your public URL.
+
 ---
 
 ▤ Backup & Recovery
@@ -916,17 +1091,20 @@ Files that matter:
 
 ```
 barcode_data/
-├── index.json           ← CRITICAL (source of truth)
-├── api_keys.json        ← CRITICAL
+├── index.json           ← CRITICAL (source of truth, but auto-rebuildable)
+├── api_keys.json        ← CRITICAL (NOT auto-rebuildable)
 ├── deletion_audit.log   ← IMPORTANT (audit trail)
-└── my_products_*.csv    ← REBUILDABLE from index.json
+├── cache/               ← DISPOSABLE
+└── my_products_*.csv    ← REBUILDABLE, but needed to rebuild index
 ```
 
 Recovery:
 
-1. Restore barcode_data/ from the backup
-2. Restart the server — the index is loaded into memory
-3. Shards are used only for export
+1. Restore barcode_data/ from backup
+2. Restart the server — index is loaded into memory
+3. If index.json is missing or corrupted, it is auto-rebuilt from CSV shards
+
+The safest strategy is to back up the whole barcode_data/ folder. Losing api_keys.json means every client must be reconfigured.
 
 ---
 
@@ -966,6 +1144,13 @@ A new shard (my_products_1.csv, my_products_2.csv, ...) is created automatically
 </details>
 
 <details>
+<summary><b>What happens if index.json is deleted?</b></summary>
+
+Nothing to worry about. On next startup, the server rebuilds index.json from the CSV shards. All products are recovered. Only reason to keep it is speed of startup on very large datasets.
+
+</details>
+
+<details>
 <summary><b>Why doesn't delete take a "delete all" option?</b></summary>
 
 By design. A single API key leak or a UI bug shouldn't be able to wipe the database. Delete requires explicit indices plus a confirmation header.
@@ -996,14 +1181,14 @@ Use /api/add-batch in batches of 100. Ten requests total.
 <details>
 <summary><b>Is the API key secure?</b></summary>
 
-It's sent as a header (not URL), so it's not logged in access logs. But keys are stored plaintext in api_keys.json — protect that file.
+It's sent as a header (not URL), so it's not logged in access logs. But keys are stored plaintext in api_keys.json — protect that file with chmod 600.
 
 </details>
 
 <details>
 <summary><b>Can I run this with multiple workers?</b></summary>
 
-Yes, but each worker has separate caches, metrics, and rate limits. For proper multi-worker use, add Redis for cache and limits plus a real database.
+Yes, but each worker has separate rate limits and metrics. The index.json file is watched via mtime and reloaded automatically, so writes propagate. For proper multi-worker deployment, add Redis for cache and rate limits plus a real database.
 
 </details>
 
@@ -1017,7 +1202,14 @@ The barcode key is removed from the index entirely. The next lookup returns 404.
 <details>
 <summary><b>Where is the "delete all" endpoint?</b></summary>
 
-There isn't one — intentionally. See Security Model.
+There isn't one — intentionally. See Design Limits.
+
+</details>
+
+<details>
+<summary><b>How big can the dataset get?</b></summary>
+
+Comfortable up to ~100,000 unique barcodes with ~200 MB index.json. Beyond that, use a real database. See Design Limits.
 
 </details>
 
@@ -1062,8 +1254,8 @@ gunicorn --bind 0.0.0.0:8000 barcode_server:app
 
 1. Stop the server
 2. Back up barcode_data/
-3. Inspect index.json (source of truth)
-4. If shards are broken, restore them from the index by triggering an update or delete
+3. Delete index.json — the server rebuilds it from CSV shards on next start
+4. If shards are also corrupted, restore from backup
 
 Never run multiple writer processes against the same barcode_data/.
 
@@ -1080,6 +1272,13 @@ Wait for the window to reset. In multi-worker setups, limits differ per worker.
 <summary><b>Search returns empty</b></summary>
 
 Check that q is non-empty. It searches product name and barcode as case-insensitive substrings.
+
+</details>
+
+<details>
+<summary><b>Render demo is slow to respond</b></summary>
+
+Free Render instances sleep after inactivity. The first request may take 10–30 seconds. render.py pings /api/ every 12 minutes to keep it warm.
 
 </details>
 
@@ -1104,6 +1303,8 @@ Never commit these files:
 barcode_data/api_keys.json
 barcode_data/deletion_audit.log
 barcode_data/*.csv
+barcode_data/index.json
+barcode_data/cache/
 .env
 *.log
 ```
