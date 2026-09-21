@@ -720,7 +720,7 @@ def interactive_edit():
     else:
         print(f"❌ Failed: {msg}")
 
-# ==================== NEW: CLI LIST ALL PRODUCTS ====================
+# ==================== CLI LIST ALL PRODUCTS ====================
 def list_all_products():
     """Display all products in a formatted table in the terminal."""
     products = db.get_all()
@@ -766,14 +766,194 @@ def interactive_add():
             break
 
 def show_stats():
-    shards = glob.glob(os.path.join(DATA_DIR, "my_products_*.csv"))
+    """Display a clean, standard-level statistics dashboard."""
+
+    # ---------- ANSI ----------
+    class C:
+        R  = '\033[0m'
+        B  = '\033[1m'
+        D  = '\033[2m'
+        CY = '\033[36m'
+        GR = '\033[32m'
+        YE = '\033[33m'
+        RE = '\033[31m'
+        BL = '\033[34m'
+        MA = '\033[35m'
+        GY = '\033[90m'
+        WH = '\033[97m'
+
+    ANSI_RE = re.compile(r'\033\[[0-9;]*m')
+    def _vis(s):
+        return len(ANSI_RE.sub('', s))
+
+    # ---------- shard scan ----------
+    def _shard_num(path):
+        m = re.search(r'_(\d+)\.csv$', path)
+        return int(m.group(1)) if m else 0
+
+    shard_files = sorted(
+        glob.glob(os.path.join(DATA_DIR, "my_products_*.csv")),
+        key=_shard_num
+    )
+
+    # ---------- aggregate index ----------
+    total_barcodes = len(db.index)
     total_products = 0
-    for prod_list in db.index.values():
-        total_products += len(prod_list)
-    print(f"\n📊 Unique Barcodes: {len(db.index)}")
-    print(f"📦 Total Products: {total_products}")
-    print(f"📁 Total Shards: {len(shards)}")
-    print(f"📄 Active Shard: {os.path.basename(db.active_shard)} ({db.active_count} rows)")
+    products_with_image = 0
+    barcodes_multi = 0
+    barcode_counts = []
+    for bc, plist in db.index.items():
+        c = len(plist)
+        total_products += c
+        barcode_counts.append((bc, c))
+        if c > 1:
+            barcodes_multi += 1
+        for p in plist:
+            if p.get('image'):
+                products_with_image += 1
+
+    products_without_image = total_products - products_with_image
+    avg_per_bc = (total_products / total_barcodes) if total_barcodes else 0
+    max_bc = max(barcode_counts, key=lambda x: x[1]) if barcode_counts else None
+
+    # ---------- sizes ----------
+    def _size(p):
+        try:
+            return os.path.getsize(p)
+        except OSError:
+            return 0
+
+    def _human(n):
+        for u in ('B', 'KB', 'MB', 'GB', 'TB'):
+            if n < 1024:
+                return f"{n:.1f} {u}"
+            n /= 1024
+        return f"{n:.1f} PB"
+
+    index_size = _size(INDEX_FILE)
+    keys_size  = _size(API_KEYS_FILE)
+    shard_sizes = [(os.path.basename(sf), _size(sf)) for sf in shard_files]
+    total_size = index_size + keys_size + sum(s for _, s in shard_sizes)
+
+    # ---------- api keys ----------
+    try:
+        kd = load_api_keys()
+        total_keys    = len(kd)
+        enabled_keys  = sum(1 for v in kd.values() if v.get('enabled', True))
+        disabled_keys = total_keys - enabled_keys
+    except Exception:
+        total_keys = enabled_keys = disabled_keys = 0
+
+    # ---------- layout ----------
+    WIDTH = 64
+
+    def gradient():
+        left  = '▁▂▃▄▅▆▇'
+        right = '▇▆▅▄▃▂▁'
+        fill = WIDTH - len(left) - len(right)
+        return f"{C.CY}{left}{'█' * fill}{right}{C.R}"
+
+    def section(symbol, title):
+        label = f"  {symbol}  {title}  "
+        pad = WIDTH - len(label)
+        if pad < 2:
+            pad = 2
+        left = pad // 2
+        right = pad - left
+        return (f"{C.GY}{'─' * left}{C.R}"
+                f"{C.CY}{C.B}{label}{C.R}"
+                f"{C.GY}{'─' * right}{C.R}")
+
+    def leader(label, value, vcolor=C.CY, label_color=C.GY, label_w=22):
+        return (f"    {label_color}{label:<{label_w}}{C.R}"
+                f" {C.GY}:{C.R} "
+                f"{vcolor}{C.B}{value}{C.R}")
+
+    def center(text):
+        pad = WIDTH - _vis(text)
+        if pad < 0:
+            pad = 0
+        left = pad // 2
+        right = pad - left
+        return f"{' ' * left}{text}{' ' * right}"
+
+    # ---------- print ----------
+    print()
+    print(gradient())
+    print(center(
+        f"{C.CY}❰{C.R}  {C.CY}◆{C.R}  "
+        f"{C.WH}{C.B}BARCODE SERVER STATISTICS{C.R}  "
+        f"{C.CY}❱{C.R}"
+    ))
+    print(gradient())
+    print()
+
+    # PRODUCTS
+    print(section('▣', 'PRODUCTS'))
+    print(leader("Unique Barcodes",        f"{total_barcodes:,}"))
+    print(leader("Total Products",         f"{total_products:,}"))
+    print(leader("Avg Products / Barcode", f"{avg_per_bc:.2f}"))
+    print(leader("Barcodes w/ Multiples",  f"{barcodes_multi:,}"))
+    if max_bc:
+        print(leader("Largest Group", f"{max_bc[1]} products  (bc: {max_bc[0]})"))
+    print()
+
+    # IMAGES
+    print(section('◈', 'IMAGES'))
+    if total_products:
+        pct_with = (products_with_image / total_products) * 100
+        pct_wo   = 100 - pct_with
+        wcol = C.GR if pct_with >= 50 else C.YE
+        ocol = C.RE if pct_wo  >= 50 else C.YE
+        print(leader("With Image URL",    f"{products_with_image:,}  ({pct_with:.1f}%)", wcol))
+        print(leader("Without Image URL", f"{products_without_image:,}  ({pct_wo:.1f}%)", ocol))
+    else:
+        print(leader("With Image URL",    "0  (0.0%)", C.GY))
+        print(leader("Without Image URL", "0  (0.0%)", C.GY))
+    print()
+
+    # STORAGE
+    print(section('▤', 'STORAGE'))
+    print(leader("Data Directory", f"{DATA_DIR}/"))
+    print(leader("Total Size",     _human(total_size)))
+    print(leader("index.json",     _human(index_size)))
+    print(leader("api_keys.json",  _human(keys_size)))
+    print(leader("Total Shards",   f"{len(shard_files)}"))
+    print()
+
+    # SHARD TABLE
+    if shard_sizes:
+        active_name = os.path.basename(db.active_shard) if db.active_shard else ""
+        print(f"    {C.D}{'Shard File':<34}{'Size':>14}{C.R}")
+        print(f"    {C.GY}{'─' * 48}{C.R}")
+        for name, sz in shard_sizes:
+            is_active = (name == active_name)
+            col = C.YE if is_active else C.GY
+            marker = f"  {C.YE}◀ active{C.R}" if is_active else ""
+            print(f"    {col}{name:<34}{_human(sz):>14}{C.R}{marker}")
+        print()
+
+    # ACTIVE SHARD
+    print(section('◎', 'ACTIVE SHARD'))
+    if db.active_shard:
+        print(leader("File", os.path.basename(db.active_shard)))
+        print(leader("Rows", f"{db.active_count:,} / {SHARD_LIMIT:,}"))
+        fill_pct = (db.active_count / SHARD_LIMIT) * 100 if SHARD_LIMIT else 0
+        bar_len  = 29
+        filled   = int(bar_len * min(db.active_count, SHARD_LIMIT) / SHARD_LIMIT) if SHARD_LIMIT else 0
+        bcol = C.GR if fill_pct < 70 else (C.YE if fill_pct < 90 else C.RE)
+        bar = f"{bcol}{'█' * filled}{C.GY}{'░' * (bar_len - filled)}{C.R}"
+        print(leader("Fill",      f"[{bar}] {fill_pct:5.1f}%", C.R))
+        print(leader("Remaining", f"{max(0, SHARD_LIMIT - db.active_count):,} rows", C.GY))
+    print()
+
+    # API KEYS
+    print(section('✦', 'API KEYS'))
+    dcol = C.GR if disabled_keys == 0 else C.YE
+    print(leader("Total Keys", f"{total_keys}"))
+    print(leader("Enabled",    f"{enabled_keys}", C.GR))
+    print(leader("Disabled",   f"{disabled_keys}", dcol))
+    print()
 
 def manage_keys():
     if len(sys.argv) < 2:
