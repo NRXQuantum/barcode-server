@@ -13,7 +13,7 @@ Fast · Secure · Self-hosted · Zero-config
 [![Status](https://img.shields.io/badge/status-stable-brightgreen)]()
 [![PRs](https://img.shields.io/badge/PRs-welcome-blueviolet)]()
 
-[▸ Quick Start](#-quick-start) &nbsp;·&nbsp; [▸ Features](#-features) &nbsp;·&nbsp; [▸ API Reference](#-api-reference) &nbsp;·&nbsp; [▸ FAQ](#-faq) &nbsp;·&nbsp; [▸ Contributing](#-contributing)
+[▸ Quick Start](#-quick-start) &nbsp;·&nbsp; [▸ Features](#-features) &nbsp;·&nbsp; [▸ API Reference](#-api-reference) &nbsp;·&nbsp; [▸ CLI Reference](#-cli-reference) &nbsp;·&nbsp; [▸ FAQ](#-faq)
 
 </div>
 
@@ -72,10 +72,9 @@ Server is live at http://localhost:5000
 Test it (local or live):
 
 ```bash
-# Using the live demo
 BASE="https://barcode-server-6vss.onrender.com"
 
-# Add a product (use your own key for the local server)
+# Add a product
 curl -X POST $BASE/api/add \
   -H "X-API-Key: my-super-secret-key-change-me" \
   -H "Content-Type: application/json" \
@@ -94,8 +93,6 @@ Environment Base URL
 Local development http://localhost:5000
 Live demo (Render) https://barcode-server-6vss.onrender.com
 Your own deployment https://your-domain.com
-
-All examples below use http://localhost:5000. Replace with your own URL as needed.
 
 ---
 
@@ -121,7 +118,7 @@ Understanding the System
 
 Using the Server
 
-· CLI Commands
+· CLI Reference
 · API Reference
 · Common Workflows
 · Authentication
@@ -163,10 +160,11 @@ Symbol Feature Description
 ◈ Hybrid Images 302 redirect by default; proxy fallback
 ▤ Pagination /api/all?page=1&per_page=50
 ▸ Search Match by name or barcode
-▣ Bulk Operations Up to 100 items per batch
+▣ Bulk Operations Add/lookup up to 100 items per call
+▸ Bulk Edit CLI Edit many products from CSV or interactively
 ■ Safe Delete Index-based, audit-logged, confirm header
 ◎ Health & Stats JSON endpoints for monitoring
-✦ CSV Injection Guard Blocks formula prefixes + control chars
+✦ CSV Injection Guard Strips control chars + formula prefix guard
 ✦ IPv4 + IPv6 Safe Rejects private/reserved addresses
 ▤ Atomic Writes JSON & CSV use temp file + os.replace
 ◎ Index Auto-Rebuild Rebuilds index.json from CSV shards if lost
@@ -192,11 +190,11 @@ Symbol Feature Description
 
 Data flow:
 
-1. Add — Validate image URL → Append to active CSV shard → Update JSON index (atomic) → Cache in background
+1. Add — Validate image URL → Append to active CSV shard → Update JSON index (atomic) → Clear lookup cache → Background image prefetch
 2. Lookup — Check cache → Fall back to in-memory index → Return list of products
 3. Image — Return 302 to original URL (fast) or stream via proxy (fallback)
 4. Delete — Verify API key + confirm header → Remove indices → Rewrite shards → Log to audit
-5. Recovery — If index.json is missing or corrupted, rebuild it from CSV shards automatically
+5. Recovery — If index.json is missing or corrupted, rebuild it from CSV shards automatically on startup
 
 ---
 
@@ -242,7 +240,7 @@ Production (Gunicorn)
 gunicorn --workers 2 --bind 0.0.0.0:5000 barcode_server:app
 ```
 
-Warning — multi-worker setups: Each worker keeps its own cache, metrics, and rate limiter. They do not share state. The app automatically picks up external changes to index.json (via mtime check), so writes propagate across workers within a request cycle. For high-concurrency or multi-machine deployments, use Redis for cache and rate limits, and a proper database.
+Warning — multi-worker setups: Each worker keeps its own rate limiter and metrics. The app automatically picks up external changes to index.json (via mtime check), so writes propagate across workers. The cache is shared on the same machine via FileSystemCache. For high-concurrency or multi-machine deployments, use Redis for cache and rate limits, and a proper database.
 
 Render.com (self-pinging)
 
@@ -254,13 +252,11 @@ Pings /api/ every 12 minutes to keep the free instance alive. Uses RENDER_EXTERN
 
 Live demo
 
-A public instance is available at:
-
 ```
 https://barcode-server-6vss.onrender.com
 ```
 
-Free Render instances sleep after inactivity. First request may take 10–30 seconds to wake the server. Data is public and may be cleared at any time.
+Free Render instances sleep after inactivity. First request may take 10–30 seconds.
 
 ---
 
@@ -270,8 +266,8 @@ Directory Layout
 
 ```
 barcode_data/
-├── index.json              # barcode → [products]  (source of truth)
-├── api_keys.json           # API key registry
+├── index.json              # barcode → [products]  (source of truth, auto-rebuildable)
+├── api_keys.json           # API key registry       (backup required)
 ├── deletion_audit.log      # every delete (success + failure)
 ├── cache/                  # FileSystemCache files
 ├── my_products_0.csv       # shard (10k rows max)
@@ -442,7 +438,7 @@ The server is not a CDN. It is a lookup service that points to images. Use ?prox
 
 CSV Injection Guard — Scope
 
-The guard strips control characters and newlines, collapses spaces, and prefixes + - = @ with ' on add and update. This blocks the common spreadsheet-formula vector. It does not attempt to sanitize:
+The guard strips ASCII control characters and newlines, collapses spaces, and prefixes + - = @ with ' on add and update. This blocks the common spreadsheet-formula vector. It does not attempt to sanitize:
 
 · Unicode bidirectional or zero-width characters
 · Delimiter confusion beyond standard CSV escaping
@@ -455,47 +451,230 @@ There is intentionally no endpoint to delete the whole database. A single leaked
 
 ---
 
-▸ CLI Commands
+▸ CLI Reference
 
 All commands run from the repo root.
 
-Add products
+Command summary
+
+Command Purpose
+--add Add one product interactively
+--add-multi Add many (interactive or from CSV)
+--add-multi --yes Add many, auto-accept conflicts
+--edit Edit one product interactively
+--edit-multi Edit many (interactive or from CSV)
+--list List all products
+--stats Show dashboard statistics
+--add-key Register a new API key
+--remove-key Remove an API key
+--list-keys List registered API keys
+
+---
+
+▸ --add — Add one product
 
 ```bash
 python barcode_server.py --add
 ```
 
-Interactive prompts: barcode → name → optional image URL.
+Prompts:
 
-Edit a product
+```
+Barcode:
+Product Name:
+Image URL (optional):
+Add another? (y/n):
+```
+
+· Empty barcode / name → rejected
+· Image URL is validated before storing
+· Press y to add another, any other key to stop
+
+---
+
+▣ --add-multi — Add many products
+
+```bash
+python barcode_server.py --add-multi
+```
+
+Two modes:
+
+Mode 1 — Interactive
+
+```
+Mode [1/2] (default 1): 1
+How many products? 3
+
+▸ [1/3]
+  Barcode : 111
+  Name    : Product A
+  Image   : https://a.jpg
+  ✓ Added · 111 → Product A
+```
+
+Mode 2 — From CSV file
+
+```
+Mode [1/2] (default 1): 2
+CSV file path: products.csv
+```
+
+CSV format (barcode,product_name,image_url — same as shards):
+
+```csv
+barcode,product_name,image_url
+111,Product A,https://a.jpg
+222,Product B,
+333,Product C,https://c.jpg
+```
+
+Conflict handling:
+
+Situation Default With --yes
+New barcode ✅ Add ✅ Add
+barcode + name + image identical ⏭ Skip ⏭ Skip
+barcode + name same, image different ❓ Ask at end ✅ Add
+barcode same, name different ✅ Add ✅ Add
+Different barcode ✅ Add ✅ Add
+
+Auto-accept conflicts:
+
+```bash
+python barcode_server.py --add-multi --yes
+```
+
+---
+
+▸ --edit — Edit one product
 
 ```bash
 python barcode_server.py --edit
 ```
 
-Select by barcode + index. Press Enter to keep the current value.
+Prompts:
 
-List all products
+```
+Enter barcode to edit:
+```
+
+· If the barcode has multiple products, shows a list and asks for the index
+· Press Enter for the new name/image to keep the current value
+· Leaving both empty cancels the edit
+
+---
+
+▸ --edit-multi — Edit many products
+
+```bash
+python barcode_server.py --edit-multi
+```
+
+Two modes:
+
+Mode 1 — Interactive
+
+```
+Mode [1/2] (default 1): 1
+How many edits? 2
+
+▸ [1/2]
+  Barcode : 6281006451865
+  Found   : Paracetamol 500mg  · https://a.jpg
+  New name   (Enter = keep): Paracetamol Extra
+  New image  (Enter = keep): 
+  ✓ Updated · 6281006451865
+```
+
+Multiple products under one barcode:
+
+```
+  Barcode : 6281006451865
+  Available products:
+    [0] Paracetamol 500mg  · https://a.jpg
+    [1] Napa 650mg  · https://b.jpg
+  Which product? (name): Napa 650mg
+  Current : Napa 650mg  · https://b.jpg
+  New name   (Enter = keep): Napa Extra
+  New image  (Enter = keep): 
+  ✓ Updated · 6281006451865 · Napa 650mg
+```
+
+Mode 2 — From CSV file
+
+CSV format (barcode,product_name,new_name,new_image):
+
+```csv
+barcode,product_name,new_name,new_image
+6281006451865,,Updated Paracetamol,https://new.jpg
+6281006451866,Napa 650mg,Napa Extra,
+6281006451867,Paracetamol 500mg,,https://new-c.jpg
+```
+
+Column Required? If blank
+barcode ✅ Row skipped
+product_name ❌ Uses the only product (if barcode has 1)
+new_name ❌ Keeps old name
+new_image ❌ Keeps old image
+
+Identifier rules:
+
+· barcode-এ ১টা প্রোডাক্ট → শুধু barcode দিলেই হবে
+· barcode-এ একাধিক প্রোডাক্ট → name দিতে হবে (নাহলে "multiple products, name required")
+
+---
+
+▤ --list — List all products
 
 ```bash
 python barcode_server.py --list
 ```
 
-Table: barcode | name | image URL.
+Prints a table: barcode | name | image URL.
 
-Show dashboard stats
+---
+
+◎ --stats — Dashboard
 
 ```bash
 python barcode_server.py --stats
 ```
 
-Colored dashboard: products, images, storage, active shard, API keys.
+Displays a colored dashboard:
 
-API key management
+```
+▁▂▃▄▅▆▇█████████████████████████████████████████████████████▇▆▅▄▃▂▁
+                 ❰  ◆  BARCODE SERVER STATISTICS  ❱
+▁▂▃▄▅▆▇█████████████████████████████████████████████████████▇▆▅▄▃▂▁
+
+────────────────────  ▣  PRODUCTS  ────────────────────
+    Unique Barcodes        : 128
+    Total Products         : 356
+    ...
+
+────────────────────  ◈  IMAGES  ────────────────────
+    With Image URL         : 312  (87.6%)
+    ...
+
+────────────────────  ▤  STORAGE  ────────────────────
+    ...
+
+────────────────────  ◎  ACTIVE SHARD  ────────────────────
+    ...
+
+────────────────────  ✦  API KEYS  ────────────────────
+    ...
+```
+
+The same data is available as JSON via GET /api/stats.
+
+---
+
+✦ Key management
 
 ```bash
-# Add
-python barcode_server.py --add-key "NEW_KEY" \
+# Add a key with custom limits
+python barcode_server.py --add-key "APP_KEY" \
   --name "Android App" \
   --limits "lookup:500,image:20,add:10"
 
@@ -532,8 +711,6 @@ GET /api/stats — JSON dashboard
 GET /api/health — Health check
 
 ▸ GET /api/lookup/&lt;barcode&gt;
-
-Public. Returns every product registered under the barcode.
 
 ```bash
 curl http://localhost:5000/api/lookup/6281006451865
@@ -573,9 +750,7 @@ curl -X POST http://localhost:5000/api/add \
 }
 ```
 
-The image URL is validated first. Duplicate barcode + name combinations are rejected.
-
-▸ POST /api/add-batch
+▣ POST /api/add-batch
 
 Requires X-API-Key. Up to 100 items per call.
 
@@ -613,7 +788,7 @@ curl -X PUT http://localhost:5000/api/update/123 \
 
 Omit a field to keep its old value. Both the lookup cache and the image cache are cleared.
 
-▸ DELETE /api/delete/&lt;barcode&gt;
+■ DELETE /api/delete/&lt;barcode&gt;
 
 Requires X-API-Key and X-Confirm-Delete: YES-DELETE.
 
@@ -672,9 +847,9 @@ curl "http://localhost:5000/api/search?q=para&page=1&per_page=20"
 }
 ```
 
-▸ GET /api/all
+▤ GET /api/all
 
-Public. Flat response when no pagination params are supplied (backward compatible):
+Flat response (backward compatible when no pagination params are supplied):
 
 ```bash
 curl http://localhost:5000/api/all
@@ -696,7 +871,7 @@ curl "http://localhost:5000/api/all?page=1&per_page=50"
 }
 ```
 
-▸ POST /api/lookup-batch
+▣ POST /api/lookup-batch
 
 Public. Up to 100 barcodes per call.
 
@@ -714,9 +889,7 @@ curl -X POST http://localhost:5000/api/lookup-batch \
 }
 ```
 
-▸ GET /api/health
-
-Public. Cheap health endpoint.
+◎ GET /api/health
 
 ```bash
 curl http://localhost:5000/api/health
@@ -733,7 +906,7 @@ curl http://localhost:5000/api/health
 }
 ```
 
-▸ GET /api/stats
+◎ GET /api/stats
 
 Public. JSON version of the --stats CLI dashboard.
 
@@ -759,7 +932,7 @@ Public. JSON version of the --stats CLI dashboard.
 }
 ```
 
-▸ GET /api/metrics
+◎ GET /api/metrics
 
 Public. Process-local metrics.
 
@@ -775,7 +948,7 @@ Public. Process-local metrics.
 }
 ```
 
-▸ GET /api/export
+✦ GET /api/export
 
 Requires X-API-Key. Downloads all CSV shards as a ZIP.
 
@@ -790,34 +963,40 @@ curl -H "X-API-Key: YOUR_KEY" \
 
 Workflow 1 — Mobile App Integration
 
-Scenario: Your mobile app scans a barcode and shows product info and an image.
-
 ```
 1. App scans barcode      →  GET /api/lookup/6281006451865
 2. API returns product list
-3. App displays           →  <img src="https://your-api.example.com/api/lookup/6281006451865/image">
+3. App displays           →  <img src="https://your-api/api/lookup/6281006451865/image">
 4. Server returns 302     →  app auto-follows → image loads
 ```
 
 No SDK needed. Works with <img> tags, Glide, SDWebImage, Flutter Image.network, and React Native.
 
-Workflow 2 — Admin Bulk Import
+Workflow 2 — Bulk Import from CSV
 
 ```bash
-# Import 500 products in 5 batches
-curl -X POST http://localhost:5000/api/add-batch \
-  -H "X-API-Key: ADMIN_KEY" \
-  -H "Content-Type: application/json" \
-  -d @batch1.json   # up to 100 items each
+# Create products.csv with barcode,product_name,image_url
+python barcode_server.py --add-multi
+#   → mode 2
+#   → products.csv
 ```
 
-Workflow 3 — Removing a Bad Entry
+Workflow 3 — Bulk Edit from CSV
+
+```bash
+# Create edits.csv with barcode,product_name,new_name,new_image
+python barcode_server.py --edit-multi
+#   → mode 2
+#   → edits.csv
+```
+
+Workflow 4 — Removing a Bad Entry
 
 ```bash
 # 1. Check what's there
 curl http://localhost:5000/api/lookup/12345
 
-# 2. Delete index 1 (the second product)
+# 2. Delete index 1
 curl -X DELETE http://localhost:5000/api/delete/12345 \
   -H "X-API-Key: ADMIN_KEY" \
   -H "X-Confirm-Delete: YES-DELETE" \
@@ -826,13 +1005,6 @@ curl -X DELETE http://localhost:5000/api/delete/12345 \
 
 # 3. Check the audit log
 tail barcode_data/deletion_audit.log
-```
-
-Workflow 4 — Search & Paginate
-
-```bash
-# Find all products with "para" in name or barcode
-curl "http://localhost:5000/api/search?q=para&page=1&per_page=50"
 ```
 
 Workflow 5 — Disaster Recovery
@@ -945,7 +1117,7 @@ URL validation Public IPv4/IPv6 only; blocks private, loopback, reserved, multic
 Redirect safety Manual follow, max 3 hops, revalidate each hop
 Content type Must be image/*
 Size limit 5 MiB streaming cap
-CSV injection Strips control chars + prefixes + - = @ on add and update
+CSV injection Strips control chars + newlines; prefixes + - = @ on add and update
 Atomic writes JSON and CSV use temp file + os.replace
 Race safety Thread locks on DB, metrics, and API key cache
 Auto-recovery Index rebuilt from shards if lost
@@ -954,7 +1126,7 @@ What it does NOT protect
 
 · ✕ Not a WAF — deploy behind nginx or Cloudflare
 · ✕ Not encrypted — use HTTPS via reverse proxy
-· ✕ Keys are stored plaintext — protect the file
+· ✕ Keys are stored plaintext — protect the file with chmod 600
 · ✕ No user-level permissions — all-or-nothing per key
 
 Recommended deployment
@@ -983,23 +1155,7 @@ Internet → Cloudflare/nginx (TLS) → Gunicorn (2 workers) → This app
 
 /api/stats
 
-```json
-{
-  "products": {
-    "unique_barcodes": 128,
-    "total_products": 356,
-    "with_image": 312,
-    "without_image": 44,
-    "avg_per_barcode": 2.78
-  },
-  "storage": {
-    "total_size_bytes": 251187,
-    "total_shards": 2
-  },
-  "active_shard": {"name": "my_products_1.csv", "rows": 156, "limit": 10000},
-  "api_keys": {"total": 3, "enabled": 3, "disabled": 0}
-}
-```
+Full statistics snapshot — products, storage, active shard, API keys.
 
 Prometheus scraping
 
@@ -1091,7 +1247,7 @@ Files that matter:
 
 ```
 barcode_data/
-├── index.json           ← CRITICAL (source of truth, but auto-rebuildable)
+├── index.json           ← CRITICAL (auto-rebuildable from shards)
 ├── api_keys.json        ← CRITICAL (NOT auto-rebuildable)
 ├── deletion_audit.log   ← IMPORTANT (audit trail)
 ├── cache/               ← DISPOSABLE
@@ -1174,7 +1330,21 @@ Because 302 keeps the server's bandwidth and RAM near zero, which is critical fo
 <details>
 <summary><b>How do I bulk import 1,000 products?</b></summary>
 
-Use /api/add-batch in batches of 100. Ten requests total.
+Use --add-multi with a CSV file (mode 2). The CSV uses the same format as shards: barcode,product_name,image_url.
+
+</details>
+
+<details>
+<summary><b>How do I bulk edit many products?</b></summary>
+
+Use --edit-multi with a CSV file. Format: barcode,product_name,new_name,new_image. Leave product_name blank if the barcode has only one product.
+
+</details>
+
+<details>
+<summary><b>Why does --edit-multi sometimes ask for product name?</b></summary>
+
+If a barcode has only one product, barcode alone is enough. If it has multiple, name is required to identify which one to update. This is by design — otherwise the server wouldn't know which product to change.
 
 </details>
 
@@ -1188,7 +1358,7 @@ It's sent as a header (not URL), so it's not logged in access logs. But keys are
 <details>
 <summary><b>Can I run this with multiple workers?</b></summary>
 
-Yes, but each worker has separate rate limits and metrics. The index.json file is watched via mtime and reloaded automatically, so writes propagate. For proper multi-worker deployment, add Redis for cache and rate limits plus a real database.
+Yes, but each worker has separate rate limits and metrics. The index.json file is watched via mtime and reloaded automatically, so writes propagate. The cache is shared on the same machine via FileSystemCache. For proper multi-worker deployment, add Redis for rate limits and a real database.
 
 </details>
 
@@ -1200,16 +1370,16 @@ The barcode key is removed from the index entirely. The next lookup returns 404.
 </details>
 
 <details>
-<summary><b>Where is the "delete all" endpoint?</b></summary>
+<summary><b>How big can the dataset get?</b></summary>
 
-There isn't one — intentionally. See Design Limits.
+Comfortable up to ~100,000 unique barcodes with ~200 MB index.json. Beyond that, use a real database. See Design Limits.
 
 </details>
 
 <details>
-<summary><b>How big can the dataset get?</b></summary>
+<summary><b>Does add() clear the lookup cache?</b></summary>
 
-Comfortable up to ~100,000 unique barcodes with ~200 MB index.json. Beyond that, use a real database. See Design Limits.
+Yes. When a product is added under an existing barcode, the barcode's lookup cache is cleared so the next lookup sees the new product immediately.
 
 </details>
 
@@ -1237,6 +1407,13 @@ Checklist:
 ☐ X-Confirm-Delete: YES-DELETE header present
 ☐ JSON body contains {"indices": [...]} with integers
 ☐ Indices are within range for that barcode
+
+</details>
+
+<details>
+<summary><b>--edit-multi fails with "multiple products, name required"</b></summary>
+
+The barcode you're editing has more than one product. Add the product_name column in your CSV (or provide the name in interactive mode) to identify which product to update.
 
 </details>
 
