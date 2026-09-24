@@ -1,0 +1,189 @@
+================================================================================
+                    barcode-server — IMAGE LICENSING
+================================================================================
+
+Copyright (c) 2025 Minhaz (NRXQuantum) <team.nrx@proton.me>
+All rights reserved.
+
+This file describes the licensing of all image content associated with
+the barcode-server project. Source code licensing is covered separately
+in the LICENSE file.
+
+This project uses images from two different sources, each governed by
+a different license. Please read each section carefully.
+
+--------------------------------------------------------------------------------
+SECTION 1: ORIGINAL PROJECT IMAGES
+--------------------------------------------------------------------------------
+
+Applies to: All images, artwork, diagrams, logos, icons, and visual
+content that were created by the project authors (Minhaz / NRXQuantum),
+including but not limited to:
+
+    - Original product photographs taken by the project authors
+    - Custom-designed graphics, icons, and diagrams
+    - Any image explicitly marked as "own", "original", or "NRXQuantum"
+    - Project logo and branding assets
+
+License: Apache License, Version 2.0
+
+Copyright 2025 Minhaz (NRXQuantum) <team.nrx@proton.me>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use these images except in compliance with the License.
+You may obtain a copy of the License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, images
+distributed under the License are distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+You may use, modify, and distribute these original images for any
+purpose, including commercial purposes, provided you retain this
+notice and comply with the Apache 2.0 terms.
+
+--------------------------------------------------------------------------------
+SECTION 2: THIRD-PARTY IMAGES (Open Food Facts)
+--------------------------------------------------------------------------------
+
+Applies to: All images sourced from, derived from, or based on content
+from Open Food Facts, including cropped, resized, edited, color-corrected,
+reconstructed, or otherwise modified versions.
+
+These images are NOT distributed with the source code repository. They
+are stored on and served from a separate image hosting server, and are
+referenced by URL only.
+
+    Original source:  Open Food Facts
+    Website:          https://world.openfoodfacts.org/
+    Original license: Creative Commons Attribution-ShareAlike 3.0
+                      Unported (CC BY-SA 3.0)
+    License URL:      https://creativecommons.org/licenses/by-sa/3.0/
+
+License of derivative images:
+    Creative Commons Attribution-ShareAlike 3.0 Unported (CC BY-SA 3.0)
+
+Because the original images are licensed under CC BY-SA 3.0, any
+derivative work (including cropped, edited, resized, or reconstructed
+versions) is also licensed under CC BY-SA 3.0, in accordance with the
+ShareAlike condition of that license.
+
+Under CC BY-SA 3.0, you are free to:
+
+    - Share  — copy and redistribute the images in any medium or format
+    - Adapt  — remix, transform, and build upon the images
+    - Use commercially
+
+Under the following terms:
+
+    - Attribution (BY) — You must give appropriate credit to Open Food
+      Facts, provide a link to the license, and indicate if changes
+      were made. You may do so in any reasonable manner, but not in
+      any way that suggests the licensor endorses you or your use.
+
+    - ShareAlike (SA) — If you remix, transform, or build upon the
+      images, you must distribute your contributions under the same
+      license as the original.
+
+    - No additional restrictions — You may not apply legal terms or
+      technological measures that legally restrict others from doing
+      anything the license permits.
+
+--------------------------------------------------------------------------------
+SECTION 3: ATTRIBUTION REQUIREMENTS
+--------------------------------------------------------------------------------
+
+If you use, redistribute, or publish any image from Section 2, you must
+provide attribution in the following manner, or in any substantially
+equivalent form that satisfies CC BY-SA 3.0:
+
+Required attribution text:
+
+    "Product image(s) sourced from Open Food Facts
+    (https://world.openfoodfacts.org/), licensed under
+    Creative Commons Attribution-ShareAlike 3.0 (CC BY-SA 3.0).
+    Some images have been cropped, edited, or reconstructed
+    from their originals."
+
+Where to place attribution:
+
+    - In a README or documentation file
+    - In an "About" or "Credits" section of your application
+    - In any location visible to end users of the images
+    - Online (e.g., a web page) if the images are served online
+
+If you distribute a modified version of an Open Food Facts image, you
+must also license your modified version under CC BY-SA 3.0.
+
+--------------------------------------------------------------------------------
+SECTION 4: HOW TO IDENTIFY WHICH LICENSE APPLIES
+--------------------------------------------------------------------------------
+
+To determine which license applies to a specific image:
+
+    - If the image is described as "original", "NRXQuantum", or was
+      created by the project authors, Section 1 applies (Apache 2.0).
+
+    - If the image originates from Open Food Facts or is a derivative
+      of an Open Food Facts image, Section 2 applies (CC BY-SA 3.0).
+
+    - If you are unsure, contact the project author before use.
+
+--------------------------------------------------------------------------------
+SECTION 5: SCOPE SEPARATION
+--------------------------------------------------------------------------------
+
+The Apache 2.0 license (Section 1) and the CC BY-SA 3.0 license
+(Section 2) apply to separate, independent components of the project.
+
+The source code does not embed, store, or incorporate the third-party
+images. It only references them by URL from a separate hosting server
+that is outside of this repository.
+
+Therefore:
+
+    - The Apache 2.0 license on the source code and original images
+      is NOT affected by the CC BY-SA 3.0 license on the third-party
+      images.
+
+    - The CC BY-SA 3.0 license on the third-party images does NOT
+      impose any ShareAlike obligations on the source code of this
+      project or on any user of the source code.
+
+This separation is deliberate and is what allows the source code to
+remain under a permissive license (Apache 2.0) suitable for commercial
+and corporate use, while still respecting the license terms of the
+third-party images.
+
+--------------------------------------------------------------------------------
+SECTION 6: FUTURE CHANGES
+--------------------------------------------------------------------------------
+
+The project authors intend to gradually replace all third-party images
+(Section 2) with original images (Section 1) during development.
+
+Once all third-party images have been removed from use, Section 2 and
+Section 3 of this file may be removed, and all image content will be
+governed solely by the Apache License, Version 2.0.
+
+Note: This section is a statement of intent only. It does not affect
+the perpetual, irrevocable nature of the CC BY-SA 3.0 license that
+applies to any third-party images that have already been used or
+distributed.
+
+--------------------------------------------------------------------------------
+SECTION 7: CONTACT
+--------------------------------------------------------------------------------
+
+For licensing questions, attribution clarifications, or if you are a
+rights holder with concerns about image usage, please contact:
+
+    Minhaz (NRXQuantum)
+    Email: team.nrx@proton.me
+
+================================================================================
+                              END OF LICENSING
+================================================================================
