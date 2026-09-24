@@ -40,6 +40,25 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# ==================== BARCODE NORMALIZATION ====================
+def _barcode_variants(barcode):
+    """Return equivalent barcode variants (UPC-A <-> EAN-13).
+
+    UPC-A : 12 digits, e.g. 840205712175
+    EAN-13: 13 digits, e.g. 0840205712175  (leading zero added)
+    """
+    if not barcode:
+        return [barcode]
+    bc = barcode.strip()
+    if not bc or not bc.isdigit():
+        return [bc]
+    variants = [bc]
+    if len(bc) == 12:
+        variants.append('0' + bc)
+    elif len(bc) == 13 and bc.startswith('0'):
+        variants.append(bc[1:])
+    return variants
+
 # ==================== ATOMIC FILE WRITE HELPERS ====================
 def _atomic_write_json(path, data):
     tmp = path + '.tmp'
@@ -304,7 +323,6 @@ class BarcodeDB:
         self._initialize()
 
     def _initialize(self):
-        # ----- Legacy migration (copy file, then rebuild) -----
         legacy_file = 'my_products.csv'
         if os.path.exists(legacy_file) and not os.path.exists(INDEX_FILE):
             logger.info("Migrating from legacy my_products.csv ...")
@@ -313,7 +331,6 @@ class BarcodeDB:
                 dst.write(src.read())
             self._rebuild_index_from_shards()
 
-        # ----- Load or rebuild index -----
         if os.path.exists(INDEX_FILE):
             try:
                 with open(INDEX_FILE, 'r', encoding='utf-8') as f:
@@ -340,7 +357,6 @@ class BarcodeDB:
         except OSError:
             self._index_mtime = 0.0
 
-        # ----- Manage shards -----
         shard_files = glob.glob(os.path.join(DATA_DIR, "my_products_*.csv"))
         if not shard_files:
             self._create_new_shard()
@@ -352,7 +368,6 @@ class BarcodeDB:
                 self._create_new_shard()
 
     def _rebuild_index_from_shards(self):
-        """Disaster recovery: rebuild index.json from CSV shards."""
         shard_files = sorted(
             glob.glob(os.path.join(DATA_DIR, "my_products_*.csv")),
             key=lambda x: int(x.split('_')[-1].split('.')[0])
@@ -438,8 +453,7 @@ class BarcodeDB:
         except Exception as e:
             logger.warning(f"Background caching failed for {barcode}: {e}")
 
-    # ---------- ADD ----------
-    def add(self, barcode, name, image, validate=True):
+    def add(self, barcode, name, image, validate=True, force=False):
         clean_img = self._extract_url(image)
         safe_barcode = sanitize_csv_field(barcode)
         safe_name = sanitize_csv_field(name)
@@ -452,7 +466,7 @@ class BarcodeDB:
 
         with self.lock:
             self._maybe_reload()
-            if raw_barcode in self.index:
+            if not force and raw_barcode in self.index:
                 for prod in self.index[raw_barcode]:
                     if prod['name'] == safe_name:
                         return False, f"Product with barcode '{raw_barcode}' and name '{safe_name}' already exists."
@@ -475,6 +489,7 @@ class BarcodeDB:
             self.active_count += 1
 
             self._save_index()
+            cache.delete(raw_barcode)
 
             if clean_img:
                 executor.submit(self._cache_image_async, clean_img, raw_barcode)
@@ -482,7 +497,6 @@ class BarcodeDB:
             logger.info(f"Product added: {raw_barcode} -> {safe_name}")
             return True, "OK"
 
-    # ---------- UPDATE ----------
     def update(self, barcode, product_index, new_name=None, new_image=None, validate=True):
         raw_barcode = barcode.strip()
         with self.lock:
@@ -526,7 +540,6 @@ class BarcodeDB:
             logger.info(f"Product updated: {raw_barcode} index {product_index} -> {final_name}")
             return True, "Update successful.", prod
 
-    # ---------- DELETE ----------
     def delete(self, barcode, indices):
         raw_barcode = barcode.strip()
         with self.lock:
@@ -602,8 +615,14 @@ class BarcodeDB:
         os.replace(tmp, shard_path)
 
     def lookup(self, barcode):
+        """Look up a barcode, trying UPC-A <-> EAN-13 variants if exact fails."""
         self._maybe_reload()
-        return self.index.get(barcode.strip(), [])
+        raw = barcode.strip()
+        for variant in _barcode_variants(raw):
+            products = self.index.get(variant, [])
+            if products:
+                return products
+        return []
 
     def get_all(self):
         self._maybe_reload()
@@ -617,7 +636,6 @@ db = BarcodeDB()
 
 # ==================== SHARED STATS COLLECTOR ====================
 def _collect_stats():
-    """Collect all stats used by both /api/stats and CLI --stats."""
     def _shard_num(p):
         m = re.search(r'_(\d+)\.csv$', p)
         return int(m.group(1)) if m else 0
@@ -749,16 +767,16 @@ def api_home():
         "message": "Multi-Product Barcode API (supports edit/update/delete/batch/search)",
         "auth": "Provide X-API-Key header for protected endpoints.",
         "endpoints": {
-            "GET /api/lookup/<barcode>": "Public (list of products)",
+            "GET /api/lookup/<barcode>": "Public (list of products; UPC-A/EAN-13 aware)",
             "GET /api/lookup/<barcode>/image": "Public (302 redirect; ?proxy=1 to stream)",
             "POST /api/lookup-batch": "Public (bulk lookup)",
-            "POST /api/add": "🔒 Requires Key",
-            "POST /api/add-batch": "🔒 Requires Key (bulk add)",
-            "PUT /api/update/<barcode>": "🔒 Requires Key",
-            "DELETE /api/delete/<barcode>": "🔒 Requires Key + X-Confirm-Delete: YES-DELETE",
+            "POST /api/add": "Requires Key",
+            "POST /api/add-batch": "Requires Key (bulk add)",
+            "PUT /api/update/<barcode>": "Requires Key",
+            "DELETE /api/delete/<barcode>": "Requires Key + X-Confirm-Delete: YES-DELETE",
             "GET /api/all": "Public (page=1&per_page=50 for paginated)",
             "GET /api/search?q=<text>": "Public (search name or barcode)",
-            "GET /api/export": "🔒 Requires Key (ZIP download)",
+            "GET /api/export": "Requires Key (ZIP download)",
             "GET /api/metrics": "Public (server performance)",
             "GET /api/stats": "Public (JSON stats)",
             "GET /api/health": "Public (health check)"
@@ -1125,34 +1143,66 @@ def redirect_all(): return redirect('/api/all')
 @app.route('/export')
 def redirect_export(): return redirect('/api/export')
 
-# ==================== CLI: EDIT ====================
+# ==================== CLI: SHARED STYLE ====================
+class _CLI:
+    """ANSI palette shared with show_stats() for consistent CLI look."""
+    R  = '\033[0m'; B  = '\033[1m'; D  = '\033[2m'
+    CY = '\033[36m'; GR = '\033[32m'; YE = '\033[33m'
+    RE = '\033[31m'; GY = '\033[90m'; WH = '\033[97m'
+
+
+def _cli_header(title, subtitle=None):
+    line = "═" * 56
+    print()
+    tail = f"  {_CLI.GY}·  {subtitle}{_CLI.R}" if subtitle else ""
+    print(f"    {_CLI.CY}◆{_CLI.R}  {_CLI.WH}{_CLI.B}{title}{_CLI.R}{tail}")
+    print(f"    {_CLI.CY}{line}{_CLI.R}")
+    print()
+
+
+def _cli_summary(added, failed, skipped, conflicts_pending=0):
+    line = "═" * 56
+    print()
+    print(f"    {_CLI.CY}{line}{_CLI.R}")
+    parts = (
+        f"{_CLI.GR}{_CLI.B}▣  {added} added{_CLI.R}"
+        f"    {_CLI.RE}{_CLI.B}✕  {failed} failed{_CLI.R}"
+        f"    {_CLI.YE}{_CLI.B}○  {skipped} skipped{_CLI.R}"
+    )
+    if conflicts_pending:
+        parts += f"    {_CLI.YE}{_CLI.B}⚠  {conflicts_pending} conflict{_CLI.R}"
+    print(f"      {parts}")
+    print(f"    {_CLI.CY}{line}{_CLI.R}")
+    print()
+
+# ==================== CLI: EDIT (single) ====================
 def interactive_edit():
     print("\n--- Edit Product (Update name or image) ---")
     barcode = input("Enter barcode to edit: ").strip()
     if not barcode:
-        print("❌ Barcode cannot be empty.")
+        print("Barcode cannot be empty.")
         return
     products = db.lookup(barcode)
     if not products:
-        print(f"❌ No products found for barcode '{barcode}'.")
+        print(f"No products found for barcode '{barcode}'.")
         return
     if len(products) == 1:
         idx = 0
     else:
-        print(f"\n📋 Found {len(products)} products for barcode '{barcode}':")
+        print(f"\nFound {len(products)} products for barcode '{barcode}':")
         for i, p in enumerate(products):
             print(f"  [{i}] {p['name']} (Image: {p['image'][:50]}...)")
         try:
             idx = int(input("Select product index to edit: ").strip())
             if idx < 0 or idx >= len(products):
-                print("❌ Invalid index.")
+                print("Invalid index.")
                 return
         except ValueError:
-            print("❌ Please enter a valid number.")
+            print("Please enter a valid number.")
             return
 
     prod = products[idx]
-    print(f"\n📌 Current data for selected product:")
+    print(f"\nCurrent data for selected product:")
     print(f"  Name : {prod['name']}")
     print(f"  Image: {prod['image']}")
 
@@ -1160,23 +1210,32 @@ def interactive_edit():
     new_image = input("New image URL (press Enter to keep unchanged): ").strip()
 
     if not new_name and not new_image:
-        print("ℹ️ No changes provided. Exiting.")
+        print("No changes provided. Exiting.")
         return
 
-    success, msg, updated = db.update(barcode, idx, new_name, new_image, validate=True)
+    stored_bc = None
+    for v in _barcode_variants(barcode):
+        if v in db.index:
+            stored_bc = v
+            break
+    if stored_bc is None:
+        print(f"Barcode '{barcode}' not found.")
+        return
+
+    success, msg, updated = db.update(stored_bc, idx, new_name, new_image, validate=True)
     if success:
-        print(f"✅ {msg}")
-        print(f"📦 Updated product: {updated}")
+        print(f"OK: {msg}")
+        print(f"Updated product: {updated}")
     else:
-        print(f"❌ Failed: {msg}")
+        print(f"Failed: {msg}")
 
 # ==================== CLI: LIST ====================
 def list_all_products():
     products = db.get_all()
     if not products:
-        print("\n📭 No products found in the database.")
+        print("\nNo products found in the database.")
         return
-    print(f"\n📋 Total Products: {len(products)}")
+    print(f"\nTotal Products: {len(products)}")
     print("=" * 150)
     print(f"{'Barcode':<20} | {'Product Name':<50} | {'Image URL'}")
     print("-" * 150)
@@ -1186,9 +1245,9 @@ def list_all_products():
             name = name[:45] + "..."
         print(f"{p['barcode']:<20} | {name:<50} | {p['image_url']}")
     print("=" * 150)
-    print(f"✅ Total {len(products)} products displayed.")
+    print(f"Total {len(products)} products displayed.")
 
-# ==================== CLI: ADD ====================
+# ==================== CLI: ADD (single) ====================
 def interactive_add():
     while True:
         print("\n--- Add New Product (supports multiple products per barcode) ---")
@@ -1197,14 +1256,445 @@ def interactive_add():
         name = input("Product Name: ").strip()
         if not name: continue
         image = input("Image URL (optional): ").strip()
-        print("⏳ Validating and queuing background cache...")
+        print("Validating and queuing background cache...")
         success, msg = db.add(barcode, name, image, validate=True)
         if success:
-            print(f"✅ Added successfully! (Shard: {os.path.basename(db.active_shard)})")
+            print(f"Added successfully! (Shard: {os.path.basename(db.active_shard)})")
         else:
-            print(f"❌ Failed: {msg}")
+            print(f"Failed: {msg}")
         if input("Add another? (y/n): ").strip().lower() != 'y':
             break
+
+# ==================== CLI: ADD MULTI ====================
+def _check_conflict(barcode, name, image):
+    raw = barcode.strip()
+    products = db.index.get(raw, [])
+    safe_name = sanitize_csv_field(name.strip())
+    clean_img = db._extract_url(image or '')
+    for p in products:
+        if p['name'] == safe_name:
+            if (p.get('image') or '') == clean_img:
+                return 'exact_dup', p
+            return 'name_conflict', p
+    return 'new', None
+
+
+def _process_add_row(barcode, name, image):
+    if not barcode or not name:
+        return 'skipped_empty', 'missing barcode or name', None
+
+    status, existing = _check_conflict(barcode, name, image)
+
+    if status == 'exact_dup':
+        return 'exact_dup', 'already exists (identical)', existing
+
+    if status == 'name_conflict':
+        return 'name_conflict', 'same name, different image', existing
+
+    ok, msg = db.add(barcode, name, image, validate=True)
+    if ok:
+        return 'added', '', None
+    return 'failed', msg, None
+
+
+def _resolve_conflicts(conflicts, auto_yes=False):
+    print()
+    print(f"    {_CLI.YE}⚠{_CLI.R}  {_CLI.WH}{_CLI.B}{len(conflicts)}{_CLI.R} product(s) already exist with a different image:")
+    print()
+    for i, (bc, name, new_img, existing) in enumerate(conflicts, 1):
+        old_img = (existing.get('image') or '') or '(no image)'
+        new_img_disp = new_img or '(no image)'
+        print(f"      {_CLI.CY}[{i}]{_CLI.R}  {bc} -> {name}")
+        print(f"           {_CLI.GY}Old:{_CLI.R} {old_img}")
+        print(f"           {_CLI.GY}New:{_CLI.R} {new_img_disp}")
+    print()
+
+    if auto_yes:
+        choice = 'y'
+        print(f"    {_CLI.GY}--yes flag detected: adding all conflicts{_CLI.R}")
+    else:
+        choice = input(f"    {_CLI.GY}Add these as separate products? (y/n):{_CLI.R} ").strip().lower()
+
+    if choice in ('y', 'yes'):
+        added = 0
+        for bc, name, img, _ in conflicts:
+            ok, msg = db.add(bc, name, img, validate=True, force=True)
+            if ok:
+                print(f"      {_CLI.GR}✓{_CLI.R} Added · {bc} -> {name}")
+                added += 1
+            else:
+                print(f"      {_CLI.RE}✕{_CLI.R} Failed · {bc} · {msg}")
+        return added
+    else:
+        print(f"      {_CLI.YE}○{_CLI.R} All {len(conflicts)} conflict(s) skipped")
+        return 0
+
+
+def interactive_add_multi():
+    auto_yes = '--yes' in sys.argv
+
+    _cli_header("ADD MULTIPLE PRODUCTS")
+
+    print(f"    {_CLI.GY}▸{_CLI.R} Select mode")
+    print(f"        {_CLI.CY}1{_CLI.R}  ·  Interactive  {_CLI.GY}(one by one){_CLI.R}")
+    print(f"        {_CLI.CY}2{_CLI.R}  ·  From file    {_CLI.GY}(barcode,product_name,image_url){_CLI.R}")
+    if auto_yes:
+        print(f"        {_CLI.YE}·  --yes flag active: conflicts will be auto-added{_CLI.R}")
+    print()
+
+    choice = input(f"    {_CLI.GY}Mode [1/2] (default 1):{_CLI.R} ").strip() or '1'
+
+    if choice == '2':
+        file_path = input(f"    {_CLI.GY}CSV file path:{_CLI.R} ").strip()
+        if not file_path:
+            print(f"\n    {_CLI.RE}✕ No path given.{_CLI.R}\n")
+            return
+        _add_multi_from_file(file_path, auto_yes)
+    else:
+        try:
+            count = int(input(f"    {_CLI.GY}How many products?{_CLI.R} ").strip())
+            if count <= 0:
+                print(f"\n    {_CLI.RE}✕ Count must be positive.{_CLI.R}\n")
+                return
+        except ValueError:
+            print(f"\n    {_CLI.RE}✕ Please enter a number.{_CLI.R}\n")
+            return
+        _add_multi_interactive(count, auto_yes)
+
+
+def _add_multi_interactive(count, auto_yes=False):
+    print(f"    {_CLI.CY}{'─' * 56}{_CLI.R}")
+    print(f"    {_CLI.GY}Entering{_CLI.R} {_CLI.WH}{_CLI.B}{count}{_CLI.R} {_CLI.GY}products{_CLI.R}")
+    print(f"    {_CLI.CY}{'─' * 56}{_CLI.R}")
+
+    added = failed = skipped = 0
+    conflicts = []
+
+    for i in range(1, count + 1):
+        print()
+        print(f"    {_CLI.CY}▸{_CLI.R} {_CLI.GY}[{i}/{count}]{_CLI.R}")
+
+        barcode = input(f"      {_CLI.GY}Barcode :{_CLI.R} ").strip()
+        if not barcode:
+            print(f"      {_CLI.YE}○ Skipped{_CLI.R} {_CLI.GY}(empty barcode){_CLI.R}")
+            skipped += 1
+            continue
+
+        name = input(f"      {_CLI.GY}Name    :{_CLI.R} ").strip()
+        if not name:
+            print(f"      {_CLI.YE}○ Skipped{_CLI.R} {_CLI.GY}(empty name){_CLI.R}")
+            skipped += 1
+            continue
+
+        image = input(f"      {_CLI.GY}Image   :{_CLI.R} ").strip()
+
+        status, msg, existing = _process_add_row(barcode, name, image)
+
+        if status == 'added':
+            print(f"      {_CLI.GR}✓ Added{_CLI.R} {_CLI.GY}·{_CLI.R} {barcode} -> {name}")
+            added += 1
+        elif status == 'exact_dup':
+            print(f"      {_CLI.YE}○ Skipped{_CLI.R} {_CLI.GY}· already exists (identical){_CLI.R}")
+            skipped += 1
+        elif status == 'name_conflict':
+            conflicts.append((barcode, name, image, existing))
+            print(f"      {_CLI.YE}⚠ Conflict noted{_CLI.R} {_CLI.GY}· will ask at the end{_CLI.R}")
+        elif status == 'skipped_empty':
+            print(f"      {_CLI.YE}○ Skipped{_CLI.R} {_CLI.GY}· {msg}{_CLI.R}")
+            skipped += 1
+        else:
+            print(f"      {_CLI.RE}✕ Failed{_CLI.R} {_CLI.GY}·{_CLI.R} {msg}")
+            failed += 1
+
+    pending = 0
+    if conflicts:
+        resolved = _resolve_conflicts(conflicts, auto_yes)
+        added += resolved
+        pending = len(conflicts) - resolved
+
+    _cli_summary(added, failed, skipped, pending)
+
+
+def _add_multi_from_file(file_path, auto_yes=False):
+    if not os.path.exists(file_path):
+        print(f"\n    {_CLI.RE}✕ File not found:{_CLI.R} {file_path}\n")
+        return
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        print(f"\n    {_CLI.RE}✕ Failed to read file:{_CLI.R} {e}\n")
+        return
+
+    if not rows:
+        print(f"\n    {_CLI.YE}○ File is empty.{_CLI.R}\n")
+        return
+
+    total = len(rows)
+    _cli_header("ADD MULTIPLE PRODUCTS", "From File")
+
+    print(f"    {_CLI.CY}▤{_CLI.R}  Found {_CLI.WH}{_CLI.B}{total}{_CLI.R} products")
+    print(f"    {_CLI.CY}▸{_CLI.R}  Adding...")
+    print()
+
+    added = failed = skipped = 0
+    conflicts = []
+
+    for i, row in enumerate(rows, 1):
+        barcode = (row.get('barcode') or '').strip()
+        name = (row.get('product_name') or row.get('name') or '').strip()
+        image = (row.get('image_url') or row.get('image') or '').strip()
+
+        if not barcode or not name:
+            print(f"      {_CLI.YE}○{_CLI.R} {i}/{total}  {_CLI.GY}skipped (missing barcode or name){_CLI.R}")
+            skipped += 1
+            continue
+
+        status, msg, existing = _process_add_row(barcode, name, image)
+
+        if status == 'added':
+            print(f"      {_CLI.GR}✓{_CLI.R} {i}/{total}  {barcode} -> {name}")
+            added += 1
+        elif status == 'exact_dup':
+            print(f"      {_CLI.YE}○{_CLI.R} {i}/{total}  {barcode}  {_CLI.GY}· already exists (identical){_CLI.R}")
+            skipped += 1
+        elif status == 'name_conflict':
+            conflicts.append((barcode, name, image, existing))
+            print(f"      {_CLI.YE}⚠{_CLI.R} {i}/{total}  {barcode}  {_CLI.GY}· conflict noted{_CLI.R}")
+        else:
+            print(f"      {_CLI.RE}✕{_CLI.R} {i}/{total}  {barcode} {_CLI.GY}·{_CLI.R} {msg}")
+            failed += 1
+
+    pending = 0
+    if conflicts:
+        resolved = _resolve_conflicts(conflicts, auto_yes)
+        added += resolved
+        pending = len(conflicts) - resolved
+
+    _cli_summary(added, failed, skipped, pending)
+
+# ==================== CLI: EDIT MULTI ====================
+def interactive_edit_multi():
+    """Edit multiple products — interactively or from a CSV file.
+    Identifier: barcode (plus product name when the barcode holds multiple products)."""
+    _cli_header("EDIT MULTIPLE PRODUCTS")
+
+    print(f"    {_CLI.GY}▸{_CLI.R} Select mode")
+    print(f"        {_CLI.CY}1{_CLI.R}  ·  Interactive  {_CLI.GY}(one by one){_CLI.R}")
+    print(f"        {_CLI.CY}2{_CLI.R}  ·  From file    {_CLI.GY}(barcode,product_name,new_name,new_image){_CLI.R}")
+    print()
+
+    choice = input(f"    {_CLI.GY}Mode [1/2] (default 1):{_CLI.R} ").strip() or '1'
+
+    if choice == '2':
+        file_path = input(f"    {_CLI.GY}CSV file path:{_CLI.R} ").strip()
+        if not file_path:
+            print(f"\n    {_CLI.RE}✕ No path given.{_CLI.R}\n")
+            return
+        _edit_multi_from_file(file_path)
+    else:
+        try:
+            count = int(input(f"    {_CLI.GY}How many edits?{_CLI.R} ").strip())
+            if count <= 0:
+                print(f"\n    {_CLI.RE}✕ Count must be positive.{_CLI.R}\n")
+                return
+        except ValueError:
+            print(f"\n    {_CLI.RE}✕ Please enter a number.{_CLI.R}\n")
+            return
+        _edit_multi_interactive(count)
+
+
+def _find_product_index(barcode, product_name=None):
+    """Locate a product under a barcode (UPC-A/EAN-13 aware).
+    Returns (status, index_or_message, products_list, stored_barcode).
+    """
+    variants = _barcode_variants(barcode)
+    stored_bc = None
+    products = []
+    for v in variants:
+        p = db.index.get(v, [])
+        if p:
+            stored_bc = v
+            products = p
+            break
+
+    if not products:
+        return 'not_found', f"barcode '{barcode}' not found", [], None
+
+    if len(products) == 1:
+        return 'ok', 0, products, stored_bc
+
+    if not product_name or not product_name.strip():
+        return 'ambiguous', 'multiple products, name required', products, stored_bc
+
+    safe_name = sanitize_csv_field(product_name.strip())
+    for i, p in enumerate(products):
+        if p['name'] == safe_name:
+            return 'ok', i, products, stored_bc
+
+    return 'name_not_found', f"product '{product_name}' not found under barcode '{barcode}'", products, stored_bc
+
+
+def _process_edit_row(barcode, product_name, new_name, new_image):
+    if not barcode or not barcode.strip():
+        return 'skipped', 'missing barcode'
+
+    new_name_clean = (new_name or '').strip()
+    new_image_clean = (new_image or '').strip()
+    if not new_name_clean and not new_image_clean:
+        return 'no_change', 'nothing to update'
+
+    status, idx_or_msg, products, stored_bc = _find_product_index(barcode, product_name)
+
+    if status == 'not_found':
+        return 'not_found', idx_or_msg
+    if status == 'ambiguous':
+        return 'ambiguous', idx_or_msg
+    if status == 'name_not_found':
+        return 'name_not_found', idx_or_msg
+
+    idx = idx_or_msg
+
+    current = products[idx]
+    current_name = current.get('name', '')
+    current_image = current.get('image', '') or ''
+    name_differs  = bool(new_name_clean) and new_name_clean != current_name
+    image_differs = bool(new_image_clean) and new_image_clean != current_image
+    if not name_differs and not image_differs:
+        return 'no_change', 'values unchanged'
+
+    ok, msg, _ = db.update(stored_bc, idx, new_name_clean or None, new_image_clean or None, validate=True)
+    if ok:
+        return 'updated', ''
+    return 'failed', msg
+
+
+def _edit_multi_interactive(count):
+    print(f"    {_CLI.CY}{'─' * 56}{_CLI.R}")
+    print(f"    {_CLI.GY}Entering{_CLI.R} {_CLI.WH}{_CLI.B}{count}{_CLI.R} {_CLI.GY}edits{_CLI.R}")
+    print(f"    {_CLI.CY}{'─' * 56}{_CLI.R}")
+
+    updated = failed = skipped = 0
+
+    for i in range(1, count + 1):
+        print()
+        print(f"    {_CLI.CY}▸{_CLI.R} {_CLI.GY}[{i}/{count}]{_CLI.R}")
+
+        barcode = input(f"      {_CLI.GY}Barcode :{_CLI.R} ").strip()
+        if not barcode:
+            print(f"      {_CLI.YE}○ Skipped{_CLI.R} {_CLI.GY}(empty barcode){_CLI.R}")
+            skipped += 1
+            continue
+
+        products = db.lookup(barcode)
+        if not products:
+            print(f"      {_CLI.RE}✕ Failed{_CLI.R} {_CLI.GY}· barcode not found{_CLI.R}")
+            failed += 1
+            continue
+
+        product_name = ''
+
+        if len(products) == 1:
+            current = products[0]
+            print(f"      {_CLI.GY}Found   :{_CLI.R} {current['name']}  {_CLI.GY}·{_CLI.R} {current['image'] or '(no image)'}")
+        else:
+            print(f"      {_CLI.GY}Available products:{_CLI.R}")
+            for j, p in enumerate(products):
+                img = p['image'] or '(no image)'
+                print(f"        {_CLI.CY}[{j}]{_CLI.R} {p['name']}  {_CLI.GY}·{_CLI.R} {img[:50]}")
+
+            product_name = input(f"      {_CLI.GY}Which product? (name):{_CLI.R} ").strip()
+            if not product_name:
+                print(f"      {_CLI.YE}○ Skipped{_CLI.R} {_CLI.GY}(no product selected){_CLI.R}")
+                skipped += 1
+                continue
+
+            safe = sanitize_csv_field(product_name)
+            match = next((p for p in products if p['name'] == safe), None)
+            if match:
+                print(f"      {_CLI.GY}Current :{_CLI.R} {match['name']}  {_CLI.GY}·{_CLI.R} {match['image'] or '(no image)'}")
+
+        new_name = input(f"      {_CLI.GY}New name   (Enter = keep):{_CLI.R} ").strip()
+        new_image = input(f"      {_CLI.GY}New image  (Enter = keep):{_CLI.R} ").strip()
+
+        status, msg = _process_edit_row(barcode, product_name, new_name, new_image)
+
+        label = barcode if not product_name else f"{barcode} · {product_name}"
+
+        if status == 'updated':
+            print(f"      {_CLI.GR}✓ Updated{_CLI.R} {_CLI.GY}·{_CLI.R} {label}")
+            updated += 1
+        elif status == 'no_change':
+            print(f"      {_CLI.YE}○ No change{_CLI.R} {_CLI.GY}· {msg}{_CLI.R}")
+            skipped += 1
+        elif status == 'skipped':
+            print(f"      {_CLI.YE}○ Skipped{_CLI.R} {_CLI.GY}· {msg}{_CLI.R}")
+            skipped += 1
+        else:
+            print(f"      {_CLI.RE}✕ Failed{_CLI.R} {_CLI.GY}· {msg}{_CLI.R}")
+            failed += 1
+
+    _cli_summary(updated, failed, skipped, 0)
+
+
+def _edit_multi_from_file(file_path):
+    if not os.path.exists(file_path):
+        print(f"\n    {_CLI.RE}✕ File not found:{_CLI.R} {file_path}\n")
+        return
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        print(f"\n    {_CLI.RE}✕ Failed to read file:{_CLI.R} {e}\n")
+        return
+
+    if not rows:
+        print(f"\n    {_CLI.YE}○ File is empty.{_CLI.R}\n")
+        return
+
+    total = len(rows)
+    _cli_header("EDIT MULTIPLE PRODUCTS", "From File")
+
+    print(f"    {_CLI.CY}▤{_CLI.R}  Found {_CLI.WH}{_CLI.B}{total}{_CLI.R} edits")
+    print(f"    {_CLI.CY}▸{_CLI.R}  Updating...")
+    print()
+
+    updated = failed = skipped = 0
+
+    for i, row in enumerate(rows, 1):
+        barcode = (row.get('barcode') or '').strip()
+        product_name = (row.get('product_name') or row.get('name') or '').strip()
+        new_name = (row.get('new_name') or '').strip()
+        new_image = (row.get('new_image') or '').strip()
+
+        status, msg = _process_edit_row(barcode, product_name, new_name, new_image)
+        label = barcode if not product_name else f"{barcode} · {product_name}"
+
+        if status == 'updated':
+            print(f"      {_CLI.GR}✓{_CLI.R} {i}/{total}  {label}")
+            updated += 1
+        elif status == 'no_change':
+            print(f"      {_CLI.YE}○{_CLI.R} {i}/{total}  {label}  {_CLI.GY}· no change{_CLI.R}")
+            skipped += 1
+        elif status == 'skipped':
+            print(f"      {_CLI.YE}○{_CLI.R} {i}/{total}  {_CLI.GY}skipped (missing barcode){_CLI.R}")
+            skipped += 1
+        elif status == 'ambiguous':
+            print(f"      {_CLI.RE}✕{_CLI.R} {i}/{total}  {barcode}  {_CLI.GY}· multiple products, name required{_CLI.R}")
+            failed += 1
+        elif status == 'name_not_found':
+            print(f"      {_CLI.RE}✕{_CLI.R} {i}/{total}  {barcode} · {product_name}  {_CLI.GY}· name not found{_CLI.R}")
+            failed += 1
+        elif status == 'not_found':
+            print(f"      {_CLI.RE}✕{_CLI.R} {i}/{total}  {barcode}  {_CLI.GY}· barcode not found{_CLI.R}")
+            failed += 1
+        else:
+            print(f"      {_CLI.RE}✕{_CLI.R} {i}/{total}  {label} {_CLI.GY}·{_CLI.R} {msg}")
+            failed += 1
+
+    _cli_summary(updated, failed, skipped, 0)
 
 # ==================== CLI: STATS ====================
 def show_stats():
@@ -1343,41 +1833,75 @@ def manage_keys():
             except (ValueError, IndexError):
                 print("Warning: Invalid limits format. Ignoring.")
         success, msg = add_new_api_key(key, name, limits)
-        print(f"{'✅' if success else '❌'} {msg}")
+        print(f"{'OK' if success else 'FAIL'}: {msg}")
 
     elif sys.argv[1] == '--remove-key':
         if len(sys.argv) < 3:
             print("Error: Usage --remove-key <key>")
             return
         success, msg = remove_api_key(sys.argv[2])
-        print(f"{'✅' if success else '❌'} {msg}")
+        print(f"{'OK' if success else 'FAIL'}: {msg}")
 
     elif sys.argv[1] == '--list-keys':
         keys = load_api_keys()
-        print("\n📋 Registered API Keys:")
+        print("\nRegistered API Keys:")
         for k, v in keys.items():
-            status = "✅ Active" if v.get('enabled', True) else "❌ Disabled"
+            status = "Active" if v.get('enabled', True) else "Disabled"
             print(f"  - {k[:20]}... ({v.get('name')}) -> {status} | Limits: {v.get('limits', {})}")
+
+# ==================== CLI: SERVER ====================
+def _start_api_server():
+    host = '0.0.0.0'
+    port = int(os.environ.get('PORT', 5000))
+    _cli_header("BARCODE SERVER")
+    print(f"    {_CLI.GY}▸{_CLI.R} Listening on  {_CLI.CY}http://{host}:{port}{_CLI.R}")
+    print(f"    {_CLI.GY}▸{_CLI.R} Barcode mode  {_CLI.GY}UPC-A / EAN-13 aware{_CLI.R}")
+    print(f"    {_CLI.GY}▸{_CLI.R} Auth header   {_CLI.GY}X-API-Key{_CLI.R}")
+    print()
+    app.run(host=host, port=port, debug=False)
+
+
+def _print_help():
+    _cli_header("BARCODE SERVER")
+    print(f"    {_CLI.GY}Usage:{_CLI.R}  python barcode_server.py <command>")
+    print()
+    print(f"    {_CLI.CY}Commands{_CLI.R}")
+    print(f"      {_CLI.CY}--api{_CLI.R}          Start the HTTP server")
+    print(f"      {_CLI.CY}--add{_CLI.R}          Add one product (interactive)")
+    print(f"      {_CLI.CY}--add-multi{_CLI.R}    Add many products (interactive or CSV)")
+    print(f"      {_CLI.CY}--edit{_CLI.R}         Edit one product (interactive)")
+    print(f"      {_CLI.CY}--edit-multi{_CLI.R}   Edit many products (interactive or CSV)")
+    print(f"      {_CLI.CY}--list{_CLI.R}         List all products")
+    print(f"      {_CLI.CY}--stats{_CLI.R}        Show dashboard statistics")
+    print(f"      {_CLI.CY}--add-key{_CLI.R}      Register a new API key")
+    print(f"      {_CLI.CY}--remove-key{_CLI.R}   Remove an API key")
+    print(f"      {_CLI.CY}--list-keys{_CLI.R}    List registered API keys")
+    print()
+    print(f"    {_CLI.GY}Example:{_CLI.R}  python barcode_server.py --api")
+    print()
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
     if len(sys.argv) > 1:
-        if sys.argv[1] in ['--add-key', '--remove-key', '--list-keys']:
+        cmd = sys.argv[1]
+        if cmd in ['--add-key', '--remove-key', '--list-keys']:
             manage_keys()
-        elif sys.argv[1] == '--add':
+        elif cmd == '--api':
+            _start_api_server()
+        elif cmd == '--add':
             interactive_add()
-        elif sys.argv[1] == '--edit':
+        elif cmd == '--add-multi':
+            interactive_add_multi()
+        elif cmd == '--edit':
             interactive_edit()
-        elif sys.argv[1] == '--list':
+        elif cmd == '--edit-multi':
+            interactive_edit_multi()
+        elif cmd == '--list':
             list_all_products()
-        elif sys.argv[1] == '--stats':
+        elif cmd == '--stats':
             show_stats()
         else:
-            print("Unknown command. Available: --add, --edit, --list, --stats, --add-key, --remove-key, --list-keys")
+            print(f"Unknown command: {cmd}")
+            print("Available: --api, --add, --add-multi, --edit, --edit-multi, --list, --stats, --add-key, --remove-key, --list-keys")
     else:
-        print(f"🚀 Multi-Product Barcode Server with Edit/Delete support running at: http://localhost:5000")
-        print(f"🔑 Use 'X-API-Key' header for secure endpoints.")
-        print(f"📊 Manage keys via CLI: --add-key, --remove-key, --list-keys")
-        print(f"📝 Edit product: python barcode_server.py --edit")
-        print(f"📋 List all products: python barcode_server.py --list")
-        app.run(host='0.0.0.0', port=5000, debug=False)
+        _print_help()
