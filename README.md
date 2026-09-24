@@ -5,15 +5,15 @@
 
 **A production-grade REST API & CLI for storing products, barcodes, and images.**
 
-Fast · Secure · Self-hosted · Zero-config
+Fast · Secure · Self-hosted · Zero-config · UPC-A / EAN-13 aware
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![Flask](https://img.shields.io/badge/flask-2.x-black)](https://flask.palletsprojects.com/)
-[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-green)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen)]()
 [![PRs](https://img.shields.io/badge/PRs-welcome-blueviolet)]()
 
-[▸ Quick Start](#-quick-start) &nbsp;·&nbsp; [▸ Features](#-features) &nbsp;·&nbsp; [▸ API Reference](#-api-reference) &nbsp;·&nbsp; [▸ CLI Reference](#-cli-reference) &nbsp;·&nbsp; [▸ FAQ](#-faq)
+[▸ Quick Start](#-quick-start) &nbsp;·&nbsp; [▸ Features](#-features) &nbsp;·&nbsp; [▸ API Reference](#-api-reference) &nbsp;·&nbsp; [▸ CLI Reference](#-cli-reference) &nbsp;·&nbsp; [▸ Licensing](#-licensing) &nbsp;·&nbsp; [▸ FAQ](#-faq)
 
 </div>
 
@@ -63,8 +63,8 @@ pip install -r requirements.txt
 # 2. Set your first API key
 export BARCODE_API_KEY="my-super-secret-key-change-me"
 
-# 3. Run
-python barcode_server.py
+# 3. Start the server
+python barcode_server.py --api
 ```
 
 Server is live at http://localhost:5000
@@ -112,6 +112,7 @@ Understanding the System
 
 · Architecture Overview
 · Storage Model
+· Barcode Formats (UPC-A / EAN-13)
 · Image Delivery Modes
 · First Startup Behavior
 · Design Limits & Non-Goals
@@ -138,6 +139,7 @@ Reference
 · FAQ
 · Troubleshooting
 · Contributing
+· Licensing
 
 </details>
 
@@ -160,8 +162,9 @@ Symbol Feature Description
 ◈ Hybrid Images 302 redirect by default; proxy fallback
 ▤ Pagination /api/all?page=1&per_page=50
 ▸ Search Match by name or barcode
-▣ Bulk Operations Add/lookup up to 100 items per call
-▸ Bulk Edit CLI Edit many products from CSV or interactively
+▣ Bulk Operations Add/lookup up to 100 items per API call
+▸ Bulk Add CLI --add-multi from CSV or interactive
+▸ Bulk Edit CLI --edit-multi from CSV or interactive
 ■ Safe Delete Index-based, audit-logged, confirm header
 ◎ Health & Stats JSON endpoints for monitoring
 ✦ CSV Injection Guard Strips control chars + formula prefix guard
@@ -169,6 +172,7 @@ Symbol Feature Description
 ▤ Atomic Writes JSON & CSV use temp file + os.replace
 ◎ Index Auto-Rebuild Rebuilds index.json from CSV shards if lost
 ▤ Multi-Worker Aware Detects external index.json changes via mtime
+◆ UPC-A / EAN-13 Aware Lookup succeeds regardless of which format the caller sends
 
 ---
 
@@ -191,7 +195,7 @@ Symbol Feature Description
 Data flow:
 
 1. Add — Validate image URL → Append to active CSV shard → Update JSON index (atomic) → Clear lookup cache → Background image prefetch
-2. Lookup — Check cache → Fall back to in-memory index → Return list of products
+2. Lookup — Check cache → Try exact barcode → Try UPC-A ↔ EAN-13 variant → Return list of products
 3. Image — Return 302 to original URL (fast) or stream via proxy (fallback)
 4. Delete — Verify API key + confirm header → Remove indices → Rewrite shards → Log to audit
 5. Recovery — If index.json is missing or corrupted, rebuild it from CSV shards automatically on startup
@@ -230,9 +234,11 @@ gunicorn Production WSGI server
 Development
 
 ```bash
-python barcode_server.py
+python barcode_server.py --api
 # → http://localhost:5000
 ```
+
+If you run python barcode_server.py without any flag, a help screen is shown.
 
 Production (Gunicorn)
 
@@ -303,6 +309,30 @@ Duplicate detection Same barcode + same name
 Index location barcode_data/index.json
 Audit log Append-only
 Auto-recovery Index rebuilt from shards if missing/corrupted
+
+---
+
+◆ Barcode Formats (UPC-A / EAN-13)
+
+The server understands that UPC-A and EAN-13 represent the same product.
+
+Format Digits Example
+UPC-A 12 840205712175
+EAN-13 13 0840205712175 (leading 0 + UPC-A)
+
+Lookup Behavior
+
+Stored in DB Caller sends Result
+840205712175 (UPC-A) 840205712175 ✅ Exact match
+840205712175 0840205712175 ✅ Variant match
+0840205712175 (EAN-13) 840205712175 ✅ Variant match
+0840205712175 0840205712175 ✅ Exact match
+12345 (non-standard) 12345 ✅ Exact only
+ABC123 (non-numeric) ABC123 ✅ Exact only
+
+Rule: Exact match first, then try the equivalent form. Only 12↔13 digit numeric barcodes have variants — everything else matches literally.
+
+This applies to /api/lookup/<barcode>, /api/lookup/<barcode>/image, /api/lookup-batch, and the --edit / --edit-multi CLI commands.
 
 ---
 
@@ -458,6 +488,7 @@ All commands run from the repo root.
 Command summary
 
 Command Purpose
+--api Start the HTTP server
 --add Add one product interactively
 --add-multi Add many (interactive or from CSV)
 --add-multi --yes Add many, auto-accept conflicts
@@ -468,6 +499,18 @@ Command Purpose
 --add-key Register a new API key
 --remove-key Remove an API key
 --list-keys List registered API keys
+
+Running with no arguments shows a help screen listing all commands.
+
+---
+
+▸ --api — Start the server
+
+```bash
+python barcode_server.py --api
+```
+
+Starts the Flask HTTP server on 0.0.0.0:5000 (or the port set by the PORT environment variable).
 
 ---
 
@@ -561,6 +604,7 @@ Enter barcode to edit:
 · If the barcode has multiple products, shows a list and asks for the index
 · Press Enter for the new name/image to keep the current value
 · Leaving both empty cancels the edit
+· Accepts both UPC-A and EAN-13 forms
 
 ---
 
@@ -619,8 +663,17 @@ new_image ❌ Keeps old image
 
 Identifier rules:
 
-· barcode-এ ১টা প্রোডাক্ট → শুধু barcode দিলেই হবে
-· barcode-এ একাধিক প্রোডাক্ট → name দিতে হবে (নাহলে "multiple products, name required")
+· barcode has 1 product → only barcode is enough
+· barcode has multiple products → product_name is required (otherwise "multiple products, name required")
+· Both UPC-A and EAN-13 forms work
+
+Result states:
+
+State Meaning
+✓ Updated Name and/or image changed
+○ No change Empty fields or identical values
+○ Skipped Missing barcode
+✕ Failed Barcode not found / bad index / name not found / validation error
 
 ---
 
@@ -696,7 +749,7 @@ Endpoint Summary
 
 Method Endpoint Auth Purpose
 GET /api/ — API info
-GET /api/lookup/<bc> — Get all products
+GET /api/lookup/<bc> — Get all products (UPC-A/EAN-13 aware)
 GET /api/lookup/<bc>/image — Get first product's image
 POST /api/lookup-batch — Bulk lookup (≤100)
 GET /api/all — List all (paginated)
@@ -730,6 +783,8 @@ curl http://localhost:5000/api/lookup/6281006451865
 ```
 
 Errors: 404 if the barcode is not found.
+
+UPC-A / EAN-13 aware — the response always echoes the caller's barcode, even if the stored key uses the other format.
 
 ▸ POST /api/add
 
@@ -1007,7 +1062,15 @@ curl -X DELETE http://localhost:5000/api/delete/12345 \
 tail barcode_data/deletion_audit.log
 ```
 
-Workflow 5 — Disaster Recovery
+Workflow 5 — UPC-A / EAN-13 Lookup
+
+```bash
+# These two return the same product
+curl http://localhost:5000/api/lookup/840205712175
+curl http://localhost:5000/api/lookup/0840205712175
+```
+
+Workflow 6 — Disaster Recovery
 
 If index.json is deleted or corrupted, no action is needed — the server rebuilds it on next startup:
 
@@ -1101,7 +1164,7 @@ Environment variables:
 
 Variable Purpose
 BARCODE_API_KEY Initial key (first startup only)
-PORT Port for render.py
+PORT Port for --api and render.py
 RENDER_EXTERNAL_URL Self-ping target
 
 ---
@@ -1293,6 +1356,13 @@ Yes. Duplicate detection is on barcode + name. Different names under the same ba
 </details>
 
 <details>
+<summary><b>Does lookup work with both UPC-A and EAN-13?</b></summary>
+
+Yes. If a barcode is stored as a 12-digit UPC-A, a lookup with the 13-digit EAN-13 form (leading zero added) will still find it — and vice versa. This works on all lookup, batch, and CLI edit paths.
+
+</details>
+
+<details>
 <summary><b>What happens when a shard reaches 10,000 rows?</b></summary>
 
 A new shard (my_products_1.csv, my_products_2.csv, ...) is created automatically. Old shards stay untouched.
@@ -1344,7 +1414,7 @@ Use --edit-multi with a CSV file. Format: barcode,product_name,new_name,new_imag
 <details>
 <summary><b>Why does --edit-multi sometimes ask for product name?</b></summary>
 
-If a barcode has only one product, barcode alone is enough. If it has multiple, name is required to identify which one to update. This is by design — otherwise the server wouldn't know which product to change.
+If a barcode has only one product, barcode alone is enough. If it has multiple, name is required to identify which one to update.
 
 </details>
 
@@ -1414,6 +1484,19 @@ Checklist:
 <summary><b>--edit-multi fails with "multiple products, name required"</b></summary>
 
 The barcode you're editing has more than one product. Add the product_name column in your CSV (or provide the name in interactive mode) to identify which product to update.
+
+</details>
+
+<details>
+<summary><b>Lookup returns 404 for a barcode I know exists</b></summary>
+
+Check that:
+
+· The barcode is 12 or 13 numeric digits (otherwise exact match only)
+· Neither form is a valid variant of the other (e.g. an internal 12345 code)
+· The stored value matches one of _barcode_variants() results
+
+For unusual formats, use /api/search?q=<partial> to locate the record.
 
 </details>
 
@@ -1499,11 +1582,39 @@ __pycache__/
 
 ---
 
-▤ License
+▤ Licensing
 
-GPL-3.0-or-later
+This project uses a multi-license model. Different components are governed by different licenses, documented in separate files for clarity.
 
-This project should include a matching LICENSE file in the repo root so the legal terms are explicit. Confirm with the maintainer before redistribution.
+Component License File
+Source code (barcode_server.py, render.py, etc.) Apache 2.0 LICENSE
+Original images and artwork (created by the project authors) Apache 2.0 LICENSE-IMAGES §1
+Third-party images from Open Food Facts (and derivatives) CC BY-SA 3.0 LICENSE-IMAGES §2
+Attribution notices — NOTICE
+
+Summary
+
+· Source code — free for commercial and corporate use, modification, and distribution. Patent grant included.
+· Original images — same as source code (Apache 2.0).
+· Third-party images — the images themselves remain under CC BY-SA 3.0. They are not distributed with this repository — only referenced by URL. This separation keeps the source code free from ShareAlike obligations.
+
+Why this model?
+
+The multi-license approach lets the source code stay permissive (Apache 2.0) so it can be used freely in commercial and corporate projects. Meanwhile, the image licensing is handled separately (Apache 2.0 for ours, CC BY-SA 3.0 for Open Food Facts-derived images). Because the third-party images are hosted on a separate server and are only referenced by URL, the ShareAlike clause does not propagate to the code or to users of the code.
+
+Attribution for Open Food Facts images
+
+If you use or redistribute Open Food Facts-derived images, include:
+
+Product image(s) sourced from Open Food Facts
+(https://world.openfoodfacts.org/), licensed under
+Creative Commons Attribution-ShareAlike 3.0 (CC BY-SA 3.0).
+Some images have been cropped, edited, or reconstructed
+from their originals.
+
+Contact
+
+Licensing questions: team.nrx@proton.me
 
 ---
 
@@ -1520,6 +1631,8 @@ Never post API keys, private data, or production exports in public issues.
 <div align="center">
 
 Built with care for the developer community
+
+© 2025 Minhaz (NRXQuantum) · team.nrx@proton.me
 
 Star this repo if it helped you.
 
