@@ -1,0 +1,31 @@
+barcode-server
+Copyright (c) 2025 Minhaz (NRXQuantum) <team.nrx@proton.me>
+
+This product includes software developed by Minhaz (NRXQuantum).
+
+================================================================================
+THIRD-PARTY CONTENT NOTICES
+================================================================================
+
+Open Food Facts
+----------------
+Some product images referenced by this project are sourced from or
+derived from Open Food Facts (https://world.openfoodfacts.org/).
+
+Licensed under the Creative Commons Attribution-ShareAlike 3.0
+Unported License (CC BY-SA 3.0).
+License text: https://creativecommons.org/licenses/by-sa/3.0/
+
+These images are not distributed with the source code. They are
+hosted on a separate image server and referenced by URL only.
+
+================================================================================
+LONGER LICENSE TEXTS
+================================================================================
+
+The full text of the Apache License 2.0 is provided in the LICENSE file.
+
+The full terms governing image content are provided in the
+LICENSE-IMAGES file.
+
+================================================================================
